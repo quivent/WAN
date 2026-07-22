@@ -35,7 +35,7 @@ export WAN_MODEL_DIR=/models/Wan2.2-T2V-A14B
 export WAN_OUTPUT_DIR=/runs/wan/outputs
 export WAN_STATE_DIR=/runs/wan/.wand
 scripts/bootstrap_h200.sh
-wan download T2V --run
+download T2V
 wan doctor
 ```
 
@@ -117,7 +117,7 @@ native repo path, GPU count, command, git SHA, and created timestamp.
 
 ```bash
 wan doctor
-wan download T2V --run
+download T2V
 wan plan "prompt" --task t2v-A14B --size 1280x720 --gpus 8
 wan plan --job jobs/examples/t2v-720p.json
 wan enqueue "prompt" --task t2v-A14B --size 1280x720 --gpus 1

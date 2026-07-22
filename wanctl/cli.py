@@ -351,10 +351,26 @@ def download(args: argparse.Namespace) -> int:
         cmd = [str(huggingface_cli), "download", model, "--local-dir", local_dir]
     else:
         cmd = [shutil.which("hf") or shutil.which("huggingface-cli") or "huggingface-cli", "download", model, "--local-dir", local_dir]
-    print(command_string(cmd))
-    if args.run:
-        return subprocess.call(cmd)
-    return 0
+    print(f"target={str(args.target or 'T2V').upper()}")
+    print(f"model={model}")
+    print(f"local_dir={local_dir}")
+    if args.plan:
+        print("state=planned")
+        print(f"run=download {str(args.target or 'T2V').upper()}")
+        print(f"command={command_string(cmd)}")
+        return 0
+    print("state=downloading")
+    print(f"command={command_string(cmd)}")
+    return subprocess.call(cmd)
+
+
+def add_download_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("target", nargs="?", default="T2V", help="model preset: T2V, I2V, TI2V, or a Hugging Face repo id")
+    parser.add_argument("--model", default="", help="override Hugging Face repo id")
+    parser.add_argument("--local-dir", default="", help="override download directory")
+    parser.add_argument("--plan", action="store_true", help="print the download plan without running it")
+    parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
+    parser.set_defaults(func=download)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -365,11 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.set_defaults(func=doctor)
 
     p_download = sub.add_parser("download")
-    p_download.add_argument("target", nargs="?", default="T2V", help="model preset: T2V, I2V, TI2V, or a Hugging Face repo id")
-    p_download.add_argument("--model", default="", help="override Hugging Face repo id")
-    p_download.add_argument("--local-dir", default="", help="override download directory")
-    p_download.add_argument("--run", action="store_true")
-    p_download.set_defaults(func=download)
+    add_download_args(p_download)
 
     p_plan = sub.add_parser("plan")
     p_plan.add_argument("prompt", nargs="?", default="")
@@ -431,6 +443,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+def download_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="download", description="Download WAN model weights")
+    add_download_args(parser)
+    args = parser.parse_args(argv)
     return args.func(args)
 
 

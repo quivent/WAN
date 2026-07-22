@@ -11,6 +11,7 @@ dependencies = []
 
 [project.scripts]
 wan = "wanctl.cli:main"
+download = "wanctl.cli:download_main"
 
 [tool.setuptools.packages.find]
 include = ["wanctl*"]
