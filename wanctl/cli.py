@@ -1119,8 +1119,12 @@ def print_pipeline_row(pos: int, record: dict[str, Any], estimate: float, queued
 def print_history_row(record: dict[str, Any], verbose: bool) -> None:
     state = str(record.get("state") or "")
     job_id = safe_job_id(record.get("job_id"))
-    duration = duration_label(job_duration(record))
-    print(f"  {state_text(state).ljust(18)} {soft(duration.rjust(8))} {soft(str(record.get('task') or 't2v-A14B').ljust(9))} {soft(str(record.get('size') or '').ljust(9))} {paint(TEAL, job_id)}")
+    if state == "running":
+        started = parse_ts(record.get("started_at") or record.get("created_at"))
+        duration_text = "elapsed " + duration_label(max(0.0, time.time() - started) if started else None)
+    else:
+        duration_text = duration_label(job_duration(record))
+    print(f"  {state_text(state).ljust(18)} {soft(duration_text.rjust(10))} {soft(str(record.get('task') or 't2v-A14B').ljust(9))} {soft(str(record.get('size') or '').ljust(9))} {paint(TEAL, job_id)}")
     prompt = str(record.get("prompt") or "").strip()
     if prompt:
         print(f"       {soft(prompt[:150])}")
