@@ -11,3 +11,6 @@ dependencies = []
 
 [project.scripts]
 wan = "wan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wan*"]
