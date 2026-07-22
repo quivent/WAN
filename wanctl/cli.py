@@ -1049,32 +1049,116 @@ def collect_job_records(paths: dict[str, pathlib.Path], limit: int) -> dict[str,
     }
 
 
-def print_job_record(record: dict[str, Any], estimate: float, queued_ahead: float, verbose: bool) -> float:
+def job_failure_reason(record: dict[str, Any]) -> str:
+    error = str(record.get("error") or "").strip()
+    if error:
+        return error
+    stderr = pathlib.Path(str(record.get("stderr_log") or record.get("stderr") or ""))
+    if stderr.is_file():
+        lines = [line.strip() for line in stderr.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+        for line in reversed(lines):
+            if "Traceback" in line:
+                continue
+            if "Error" in line or "Exception" in line or "AssertionError" in line or "CUDA" in line:
+                return line
+        if lines:
+            return lines[-1]
+    return "failed without a recorded error"
+
+
+def job_seed(record: dict[str, Any]) -> str:
+    return str(record.get("seed")) if record.get("seed") is not None else "-"
+
+
+def job_flags(record: dict[str, Any]) -> str:
+    flags = []
+    flags.append("bf16" if record.get("convert_model_dtype", True) else "native-dtype")
+    flags.append("offload" if record.get("offload_model", True) else "no-offload")
+    if record.get("t5_cpu"):
+        flags.append("t5-cpu")
+    if record.get("sample_steps") is not None:
+        flags.append(f"{record.get('sample_steps')} steps")
+    if record.get("frame_num") is not None:
+        flags.append(f"{record.get('frame_num')} frames")
+    return ",".join(flags)
+
+
+def print_table_header() -> None:
+    print(f"  {soft('POS'.ljust(4))} {soft('STATE'.ljust(9))} {soft('ETA'.rjust(6))} {soft('ELAPSED'.rjust(8))} {soft('TASK'.ljust(9))} {soft('SIZE'.ljust(9))} {soft('SEED'.ljust(8))} {soft('RUNTIME'.ljust(24))} JOB")
+
+
+def print_pipeline_row(pos: int, record: dict[str, Any], estimate: float, queued_ahead: float, verbose: bool) -> float:
     state = str(record.get("state") or "")
     job_id = safe_job_id(record.get("job_id"))
     prompt = str(record.get("prompt") or "").strip()
     started = parse_ts(record.get("started_at") or record.get("created_at"))
     elapsed = max(0.0, time.time() - started) if started and state == "running" else None
     eta = max(0.0, estimate - (elapsed or 0.0)) if state == "running" else queued_ahead + estimate
-    duration = job_duration(record)
-    facts = [
-        str(record.get("task") or "t2v-A14B"),
-        str(record.get("size") or ""),
-        f"seed {record.get('seed')}" if record.get("seed") is not None else "",
-        f"elapsed {duration_label(elapsed)}" if elapsed is not None else "",
-        f"eta {duration_label(eta)}" if state in {"queue", "running"} else "",
-        f"duration {duration_label(duration)}" if duration is not None else "",
-    ]
-    print(f"    {paint(TEAL, job_id)} {state_text(state)} {soft(' · '.join(x for x in facts if x))}")
+    eta_text = duration_label(eta) if state in {"queue", "running"} else "-"
+    elapsed_text = duration_label(elapsed) if elapsed is not None else "-"
+    print(
+        "  "
+        + soft(str(pos).ljust(4))
+        + f" {state_text(state).ljust(18)}"
+        + f" {paint(GOLD, eta_text.rjust(6))}"
+        + f" {soft(elapsed_text.rjust(8))}"
+        + f" {soft(str(record.get('task') or 't2v-A14B').ljust(9))}"
+        + f" {soft(str(record.get('size') or '').ljust(9))}"
+        + f" {soft(job_seed(record).ljust(8))}"
+        + f" {soft(job_flags(record)[:24].ljust(24))}"
+        + f" {paint(TEAL, job_id)}"
+    )
     if prompt:
-        print(f"      {prompt[:140]}")
-    if record.get("output_path"):
-        print(f"      {soft(str(record['output_path']))}")
+        print(f"       {soft(prompt[:150])}")
     if verbose:
-        print(f"      {soft(str(record.get('state_file') or ''))}")
-        if record.get("error"):
-            print(f"      {paint(ROSE, str(record.get('error'))[:220])}")
+        print(f"       {soft(str(record.get('output_path') or ''))}")
+        print(f"       {soft(str(record.get('state_file') or ''))}")
     return eta if state == "queue" else queued_ahead
+
+
+def print_history_row(record: dict[str, Any], verbose: bool) -> None:
+    state = str(record.get("state") or "")
+    job_id = safe_job_id(record.get("job_id"))
+    duration = duration_label(job_duration(record))
+    print(f"  {state_text(state).ljust(18)} {soft(duration.rjust(8))} {soft(str(record.get('task') or 't2v-A14B').ljust(9))} {soft(str(record.get('size') or '').ljust(9))} {paint(TEAL, job_id)}")
+    prompt = str(record.get("prompt") or "").strip()
+    if prompt:
+        print(f"       {soft(prompt[:150])}")
+    if state == "failed":
+        print(f"       {paint(ROSE, job_failure_reason(record)[:180])}")
+    if verbose:
+        print(f"       {soft(str(record.get('output_path') or ''))}")
+        print(f"       {soft(str(record.get('state_file') or ''))}")
+
+
+def pipeline_cmd(args: argparse.Namespace) -> int:
+    paths = ensure_state_dirs(args.state_dir)
+    records = collect_job_records(paths, args.limit)
+    all_records = [record for values in records.values() for record in values]
+    estimate = duration_estimate(all_records)
+    active = records["running"] + list(reversed(records["queue"]))
+    if args.json:
+        print(json.dumps({"state_dir": args.state_dir, "estimate_seconds": estimate, "pipeline": active}, indent=2, sort_keys=True))
+        return 0
+    header("pipeline", "WAN execution line")
+    kv("state dir", args.state_dir)
+    kv("duration estimate", duration_label(estimate))
+    kv("running", len(records["running"]))
+    kv("queued", len(records["queue"]))
+    if not active:
+        print(soft("no running or queued WAN jobs"))
+    else:
+        print()
+        print_table_header()
+        queued_ahead = 0.0
+        for pos, record in enumerate(active, 1):
+            queued_ahead = print_pipeline_row(pos, record, estimate, queued_ahead, args.verbose)
+    if args.failed and records["failed"]:
+        print()
+        suite("recent failures", ROSE, [])
+        for record in records["failed"][: args.failed]:
+            print_history_row(record, args.verbose)
+    return 0
 
 
 def jobs(args: argparse.Namespace) -> int:
@@ -1088,14 +1172,13 @@ def jobs(args: argparse.Namespace) -> int:
     header("jobs", "WAN queue state")
     kv("state dir", args.state_dir)
     kv("duration estimate", duration_label(estimate))
-    queued_ahead = 0.0
     for name in ("queue", "running", "done", "failed"):
         rows = records[name]
         kv(name, state_text(str(len(rows))) if rows else "0")
         show_rows = args.verbose or name in {"queue", "running", "failed"} or (name == "done" and args.done)
         if show_rows:
             for record in rows:
-                queued_ahead = print_job_record(record, estimate, queued_ahead, args.verbose)
+                print_history_row(record, args.verbose)
     return 0
 
 
@@ -1518,13 +1601,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--stop-on-failure", action="store_true")
     p_worker.set_defaults(func=worker)
 
-    p_jobs = sub.add_parser("jobs", aliases=["queue", "pipeline"])
+    p_jobs = sub.add_parser("jobs", aliases=["queue"])
     p_jobs.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     p_jobs.add_argument("--verbose", "-v", action="store_true")
     p_jobs.add_argument("--limit", type=int, default=20)
     p_jobs.add_argument("--json", action="store_true")
     p_jobs.add_argument("--done", action="store_true", help="include completed rows in the detailed listing")
     p_jobs.set_defaults(func=jobs)
+
+    p_pipeline = sub.add_parser("pipeline", aliases=["pipe"])
+    p_pipeline.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    p_pipeline.add_argument("--verbose", "-v", action="store_true")
+    p_pipeline.add_argument("--limit", type=int, default=20)
+    p_pipeline.add_argument("--json", action="store_true")
+    p_pipeline.add_argument("--failed", type=int, default=3, help="show this many recent failures below the active line; 0 hides them")
+    p_pipeline.set_defaults(func=pipeline_cmd)
 
     p_nexus = sub.add_parser("nexus")
     p_nexus.add_argument("nexus_command", nargs="?", choices=["status", "health", "jobs"], default="status")
