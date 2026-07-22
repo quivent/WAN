@@ -1,0 +1,9 @@
+torch>=2.4
+torchvision
+diffusers
+transformers
+accelerate
+sentencepiece
+protobuf
+safetensors
+huggingface_hub[cli]

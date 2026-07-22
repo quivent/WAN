@@ -1,0 +1,14 @@
+{
+  "prompt": "A slow cinematic push through a rainy neon market, reflections rippling across black stone, vendors closing glowing stalls, realistic handheld motion",
+  "task": "t2v-A14B",
+  "size": "1280x720",
+  "gpus": 8,
+  "model_dir": "/models/Wan2.2-T2V-A14B",
+  "native_repo": "/opt/Wan2.2",
+  "output_dir": "outputs",
+  "seed": 617538272,
+  "use_prompt_extend": false,
+  "convert_model_dtype": true,
+  "offload_model": true,
+  "t5_cpu": false
+}

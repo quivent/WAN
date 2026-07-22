@@ -1,0 +1,11 @@
+name: h100x8-fsdp-ulysses
+backend: native
+gpus: 8
+task: t2v-A14B
+size: 1280x720
+dit_fsdp: true
+t5_fsdp: true
+ulysses_size: 8
+offload_model: true
+convert_model_dtype: true
+notes: "Primary enterprise lane; torchrun with FSDP and Ulysses."

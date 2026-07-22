@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.wand/
+outputs/
+models/
+checkpoints/
+*.log
+*.mp4
+*.mov
+*.mkv

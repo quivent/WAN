@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wan-enterprise-runner"
+version = "0.1.0"
+description = "Private WAN enterprise GPU video runner control repo"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+wan = "wan.cli:main"
