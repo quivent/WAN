@@ -71,7 +71,7 @@ def color_enabled() -> bool:
         return True
     if os.environ.get("WAN_NO_COLOR") or os.environ.get("NO_COLOR"):
         return False
-    return sys.stdout.isatty()
+    return True
 
 
 def paint(color: str, text: str) -> str:
@@ -105,7 +105,7 @@ def header(title: str, subtitle: str = "") -> None:
     if subtitle:
         line += paint(DIM, f"  {subtitle}")
     print(line)
-    print(paint(INDIGO, "-" * 60))
+    print(paint(INDIGO, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
 
 
 def kv(name: str, value: object) -> None:
@@ -116,7 +116,19 @@ def command_block(command: list[str] | str, label: str = "Command") -> None:
     text = command if isinstance(command, str) else command_string(command)
     print()
     print(paint(GOLD, label))
-    print(f"  {paint(TEAL + BOLD, text)}")
+    print(f"  {paint(GOLD, '$ ')}{paint(TEAL + BOLD, text)}")
+
+
+def banner() -> None:
+    print()
+    print(paint(VIOLET, " __        ___    _   _ "))
+    print(paint(INDIGO, " \\ \\      / / \\  | \\ | |"))
+    print(paint(TEAL, "  \\ \\ /\\ / / _ \\ |  \\| |"))
+    print(paint(MINT, "   \\ V  V / ___ \\| |\\  |"))
+    print(paint(GOLD, "    \\_/\\_/_/   \\_\\_| \\_|"))
+    print(paint(BOLD + VIOLET, "wan") + paint(DIM, "  enterprise GPU video forge"))
+    print(paint(INDIGO, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
+    print(paint(DIM, "  Native Wan2.2 · H200 queue worker · reproducible video jobs"))
 
 
 def normalize_size(value: str) -> str:
@@ -456,7 +468,7 @@ def add_download_args(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wan", description="WAN enterprise GPU control CLI")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     p_doctor = sub.add_parser("doctor")
     p_doctor.set_defaults(func=doctor)
@@ -523,7 +535,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        banner()
+        print()
+        print(paint(GOLD, "Commands"))
+        for left, right in [
+            ("download T2V", "download text-to-video weights"),
+            ("wan doctor", "inspect H200 runtime readiness"),
+            ("wan plan \"prompt\"", "show native Wan2.2 command"),
+            ("wan enqueue \"prompt\"", "queue a continuous render job"),
+            ("wan jobs --verbose", "inspect queue state"),
+        ]:
+            print(f"  {paint(TEAL, left.ljust(24))} {paint(DIM, right)}")
+        return 0
+    args = parser.parse_args(argv)
     return args.func(args)
 
 
