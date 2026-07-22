@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import platform
+import random
 import shutil
 import subprocess
 import sys
@@ -15,14 +16,16 @@ from dataclasses import asdict, dataclass
 DEFAULT_NATIVE_REPO = os.environ.get("WAN_NATIVE_REPO", "/opt/Wan2.2")
 DEFAULT_MODEL_DIR = os.environ.get("WAN_MODEL_DIR", "/models/Wan2.2-T2V-A14B")
 DEFAULT_OUTPUT_DIR = os.environ.get("WAN_OUTPUT_DIR", "outputs")
+DEFAULT_STATE_DIR = os.environ.get("WAN_STATE_DIR", ".wand")
 
 
 @dataclass
 class JobSpec:
     prompt: str
+    job_id: str | None = None
     task: str = "t2v-A14B"
     size: str = "1280x720"
-    gpus: int = 8
+    gpus: int = 1
     model_dir: str = DEFAULT_MODEL_DIR
     native_repo: str = DEFAULT_NATIVE_REPO
     output_dir: str = DEFAULT_OUTPUT_DIR
@@ -32,11 +35,13 @@ class JobSpec:
     offload_model: bool = True
     t5_cpu: bool = False
 
-    @property
-    def job_id(self) -> str:
+    def ensure_job_id(self) -> str:
+        if self.job_id:
+            return self.job_id
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        suffix = "random" if self.seed is None else str(self.seed)
-        return f"wan-{self.task.lower()}-{stamp}-seed-{suffix}"
+        suffix = str(random.randrange(100000, 999999)) if self.seed is None else str(self.seed)
+        self.job_id = f"wan-{self.task.lower()}-{stamp}-seed-{suffix}"
+        return self.job_id
 
 
 def shell_quote(value: str) -> str:
@@ -85,7 +90,8 @@ def native_command(spec: JobSpec) -> list[str]:
 
 
 def command_string(parts: list[str]) -> str:
-    return " ".join(shell_quote(p) if any(ch.isspace() for ch in p) else p for p in parts)
+    special = set(" \t\n*?[];$&(){}<>|\"'`")
+    return " ".join(shell_quote(p) if any(ch in special for ch in p) else p for p in parts)
 
 
 def load_job(path: str) -> JobSpec:
@@ -94,22 +100,121 @@ def load_job(path: str) -> JobSpec:
 
 
 def write_manifest(spec: JobSpec, command: list[str]) -> pathlib.Path:
-    root = pathlib.Path(spec.output_dir).expanduser() / spec.job_id
+    job_id = spec.ensure_job_id()
+    root = pathlib.Path(spec.output_dir).expanduser() / job_id
     root.mkdir(parents=True, exist_ok=True)
     manifest = asdict(spec)
     manifest.update(
         {
-            "job_id": spec.job_id,
+            "job_id": job_id,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "command": command,
             "command_string": command_string(command),
             "git_sha": git_sha(),
+            "status": "planned",
         }
     )
     manifest_path = root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     (root / "command.sh").write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + command_string(command) + "\n")
     return manifest_path
+
+
+def state_paths(state_dir: str = DEFAULT_STATE_DIR) -> dict[str, pathlib.Path]:
+    root = pathlib.Path(state_dir).expanduser()
+    return {
+        "root": root,
+        "queue": root / "queue",
+        "running": root / "running",
+        "done": root / "done",
+        "failed": root / "failed",
+    }
+
+
+def ensure_state_dirs(state_dir: str = DEFAULT_STATE_DIR) -> dict[str, pathlib.Path]:
+    paths = state_paths(state_dir)
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def spec_from_args(args: argparse.Namespace) -> JobSpec:
+    return load_job(args.job) if getattr(args, "job", None) else JobSpec(
+        prompt=args.prompt,
+        task=args.task,
+        size=args.size,
+        gpus=args.gpus,
+        model_dir=args.model_dir,
+        native_repo=args.native_repo,
+        output_dir=args.output_dir,
+        seed=args.seed,
+        use_prompt_extend=args.prompt_extend,
+        offload_model=not args.no_offload,
+        convert_model_dtype=not args.no_convert_dtype,
+        t5_cpu=args.t5_cpu,
+    )
+
+
+def queue_job(spec: JobSpec, state_dir: str = DEFAULT_STATE_DIR) -> pathlib.Path:
+    paths = ensure_state_dirs(state_dir)
+    job_id = spec.ensure_job_id()
+    path = paths["queue"] / f"{job_id}.json"
+    path.write_text(json.dumps(asdict(spec), indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def job_output_dir(spec: JobSpec) -> pathlib.Path:
+    return pathlib.Path(spec.output_dir).expanduser() / spec.ensure_job_id()
+
+
+def update_manifest(path: pathlib.Path, **updates: object) -> None:
+    data = json.loads(path.read_text()) if path.exists() else {}
+    data.update(updates)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def run_spec(spec: JobSpec, dry_run: bool = False) -> int:
+    spec.ensure_job_id()
+    command = native_command(spec)
+    out_dir = job_output_dir(spec)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = write_manifest(spec, command)
+    update_manifest(
+        manifest_path,
+        status="running",
+        started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
+    if dry_run:
+        update_manifest(manifest_path, status="planned")
+        print(command_string(command))
+        print(f"manifest={manifest_path}")
+        return 0
+
+    stdout_path = out_dir / "stdout.log"
+    stderr_path = out_dir / "stderr.log"
+    started = time.time()
+    with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
+        try:
+            proc = subprocess.run(command, cwd=spec.native_repo, stdout=stdout, stderr=stderr, check=False)
+            returncode = proc.returncode
+        except OSError as exc:
+            stderr.write(f"{type(exc).__name__}: {exc}\n".encode())
+            returncode = 127
+    elapsed = time.time() - started
+    status = "done" if returncode == 0 else "failed"
+    update_manifest(
+        manifest_path,
+        status=status,
+        returncode=returncode,
+        finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        seconds=round(elapsed, 3),
+        stdout_log=str(stdout_path),
+        stderr_log=str(stderr_path),
+    )
+    print(f"job_id={spec.job_id}")
+    print(f"status={status}")
+    print(f"manifest={manifest_path}")
+    return returncode
 
 
 def git_sha() -> str:
@@ -143,24 +248,67 @@ def doctor(_: argparse.Namespace) -> int:
 
 
 def plan(args: argparse.Namespace) -> int:
-    spec = load_job(args.job) if args.job else JobSpec(
-        prompt=args.prompt,
-        task=args.task,
-        size=args.size,
-        gpus=args.gpus,
-        model_dir=args.model_dir,
-        native_repo=args.native_repo,
-        output_dir=args.output_dir,
-        seed=args.seed,
-        use_prompt_extend=args.prompt_extend,
-        offload_model=not args.no_offload,
-        convert_model_dtype=not args.no_convert_dtype,
-        t5_cpu=args.t5_cpu,
-    )
+    spec = spec_from_args(args)
     command = native_command(spec)
     print(command_string(command))
     if args.write_manifest:
         print(f"manifest={write_manifest(spec, command)}")
+    return 0
+
+
+def enqueue(args: argparse.Namespace) -> int:
+    spec = spec_from_args(args)
+    path = queue_job(spec, args.state_dir)
+    print(f"job_id={spec.job_id}")
+    print(f"queued={path}")
+    return 0
+
+
+def run_next(args: argparse.Namespace) -> int:
+    paths = ensure_state_dirs(args.state_dir)
+    queued = sorted(paths["queue"].glob("*.json"))
+    if not queued:
+        if not args.quiet:
+            print("queue=empty")
+        return 0
+
+    queued_path = queued[0]
+    running_path = paths["running"] / queued_path.name
+    queued_path.replace(running_path)
+    spec = load_job(str(running_path))
+    rc = run_spec(spec, dry_run=args.dry_run)
+    target_dir = paths["done"] if rc == 0 else paths["failed"]
+    running_path.replace(target_dir / running_path.name)
+    return rc
+
+
+def worker(args: argparse.Namespace) -> int:
+    processed = 0
+    print(f"state_dir={args.state_dir}")
+    print(f"poll_seconds={args.poll}")
+    while True:
+        paths = ensure_state_dirs(args.state_dir)
+        if not any(paths["queue"].glob("*.json")):
+            if args.once:
+                return 0
+            time.sleep(args.poll)
+            continue
+        rc = run_next(argparse.Namespace(state_dir=args.state_dir, dry_run=args.dry_run, quiet=True))
+        processed += 1
+        if rc != 0 and args.stop_on_failure:
+            return rc
+        if args.max_jobs and processed >= args.max_jobs:
+            return 0
+
+
+def jobs(args: argparse.Namespace) -> int:
+    paths = ensure_state_dirs(args.state_dir)
+    for name in ("queue", "running", "done", "failed"):
+        files = sorted(paths[name].glob("*.json"))
+        print(f"{name}={len(files)}")
+        if args.verbose:
+            for path in files[-args.limit:]:
+                print(f"  {path}")
     return 0
 
 
@@ -190,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--job", help="load a JSON job spec")
     p_plan.add_argument("--task", default="t2v-A14B")
     p_plan.add_argument("--size", default="1280x720")
-    p_plan.add_argument("--gpus", type=int, default=8)
+    p_plan.add_argument("--gpus", type=int, default=1)
     p_plan.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     p_plan.add_argument("--native-repo", default=DEFAULT_NATIVE_REPO)
     p_plan.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
@@ -201,6 +349,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--no-convert-dtype", action="store_true")
     p_plan.add_argument("--write-manifest", action="store_true")
     p_plan.set_defaults(func=plan)
+
+    p_enqueue = sub.add_parser("enqueue")
+    p_enqueue.add_argument("prompt", nargs="?", default="")
+    p_enqueue.add_argument("--job", help="load a JSON job spec")
+    p_enqueue.add_argument("--task", default="t2v-A14B")
+    p_enqueue.add_argument("--size", default="1280x720")
+    p_enqueue.add_argument("--gpus", type=int, default=1)
+    p_enqueue.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    p_enqueue.add_argument("--native-repo", default=DEFAULT_NATIVE_REPO)
+    p_enqueue.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    p_enqueue.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    p_enqueue.add_argument("--seed", type=int)
+    p_enqueue.add_argument("--prompt-extend", action="store_true")
+    p_enqueue.add_argument("--t5-cpu", action="store_true")
+    p_enqueue.add_argument("--no-offload", action="store_true")
+    p_enqueue.add_argument("--no-convert-dtype", action="store_true")
+    p_enqueue.set_defaults(func=enqueue)
+
+    p_run_next = sub.add_parser("run-next")
+    p_run_next.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    p_run_next.add_argument("--dry-run", action="store_true")
+    p_run_next.add_argument("--quiet", action="store_true")
+    p_run_next.set_defaults(func=run_next)
+
+    p_worker = sub.add_parser("worker")
+    p_worker.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    p_worker.add_argument("--poll", type=float, default=10.0)
+    p_worker.add_argument("--once", action="store_true")
+    p_worker.add_argument("--dry-run", action="store_true")
+    p_worker.add_argument("--max-jobs", type=int, default=0)
+    p_worker.add_argument("--stop-on-failure", action="store_true")
+    p_worker.set_defaults(func=worker)
+
+    p_jobs = sub.add_parser("jobs")
+    p_jobs.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    p_jobs.add_argument("--verbose", "-v", action="store_true")
+    p_jobs.add_argument("--limit", type=int, default=20)
+    p_jobs.set_defaults(func=jobs)
 
     return parser
 

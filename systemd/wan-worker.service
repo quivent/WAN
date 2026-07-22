@@ -1,0 +1,20 @@
+[Unit]
+Description=WAN continuous H200 render worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/WAN
+Environment=WAN_HOME=/opt/WAN
+Environment=WAN_NATIVE_REPO=/opt/Wan2.2
+Environment=WAN_MODEL_DIR=/models/Wan2.2-T2V-A14B
+Environment=WAN_OUTPUT_DIR=/runs/wan/outputs
+Environment=WAN_STATE_DIR=/runs/wan/.wand
+Environment=POLL_SECONDS=10
+ExecStart=/opt/WAN/scripts/wan_worker_h200.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

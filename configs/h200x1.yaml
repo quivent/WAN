@@ -1,0 +1,11 @@
+name: h200x1
+backend: native
+gpus: 1
+task: t2v-A14B
+size: 1280x720
+offload_model: true
+convert_model_dtype: true
+t5_cpu: false
+state_dir: /runs/wan/.wand
+output_dir: /runs/wan/outputs
+notes: "Primary single-H200 lane; direct python generate.py with 720p A14B."

@@ -24,6 +24,54 @@ make doctor
 make plan PROMPT="a slow cinematic push through a rainy neon market"
 ```
 
+## H200 Continuous Worker
+
+On a fresh H200 host, clone this repo to `/opt/WAN`, then run:
+
+```bash
+cd /opt/WAN
+export WAN_NATIVE_REPO=/opt/Wan2.2
+export WAN_MODEL_DIR=/models/Wan2.2-T2V-A14B
+export WAN_OUTPUT_DIR=/runs/wan/outputs
+export WAN_STATE_DIR=/runs/wan/.wand
+scripts/bootstrap_h200.sh
+wan download --model Wan-AI/Wan2.2-T2V-A14B --local-dir "$WAN_MODEL_DIR" --run
+wan doctor
+```
+
+Queue jobs:
+
+```bash
+wan enqueue "a slow cinematic push through a rainy neon market" \
+  --task t2v-A14B \
+  --size 1280x720 \
+  --gpus 1
+
+wan enqueue --job jobs/examples/t2v-720p.json
+wan jobs --verbose
+```
+
+Run continuously:
+
+```bash
+wan worker --state-dir "$WAN_STATE_DIR" --poll 10
+```
+
+For systemd, copy `systemd/wan-worker.service` to
+`/etc/systemd/system/wan-worker.service`, adjust paths if needed, then enable
+it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now wan-worker
+```
+
+For Slurm:
+
+```bash
+sbatch slurm/wan-worker-h200.sbatch
+```
+
 The first concrete target is native Wan2.2 T2V on CUDA:
 
 ```bash
@@ -72,4 +120,7 @@ wan doctor
 wan download --model Wan-AI/Wan2.2-T2V-A14B --local-dir /models/Wan2.2-T2V-A14B
 wan plan "prompt" --task t2v-A14B --size 1280x720 --gpus 8
 wan plan --job jobs/examples/t2v-720p.json
+wan enqueue "prompt" --task t2v-A14B --size 1280x720 --gpus 1
+wan worker
+wan jobs --verbose
 ```
