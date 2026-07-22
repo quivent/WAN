@@ -54,6 +54,10 @@ def normalize_size(value: str) -> str:
 
 def native_command(spec: JobSpec) -> list[str]:
     generate = str(pathlib.Path(spec.native_repo) / "generate.py")
+    python = sys.executable
+    torchrun = str(pathlib.Path(sys.executable).with_name("torchrun"))
+    if not pathlib.Path(torchrun).exists():
+        torchrun = shutil.which("torchrun") or "torchrun"
     base = [
         generate,
         "--task",
@@ -77,9 +81,9 @@ def native_command(spec: JobSpec) -> list[str]:
         base += ["--base_seed", str(spec.seed)]
 
     if spec.gpus <= 1:
-        return ["python", *base]
+        return [python, *base]
     return [
-        "torchrun",
+        torchrun,
         f"--nproc_per_node={spec.gpus}",
         *base,
         "--dit_fsdp",
@@ -231,8 +235,10 @@ def doctor(_: argparse.Namespace) -> int:
     print(f"native_repo_exists={pathlib.Path(DEFAULT_NATIVE_REPO).exists()}")
     print(f"model_dir={DEFAULT_MODEL_DIR}")
     print(f"model_dir_exists={pathlib.Path(DEFAULT_MODEL_DIR).exists()}")
-    print(f"torchrun={shutil.which('torchrun') or ''}")
-    print(f"huggingface-cli={shutil.which('huggingface-cli') or ''}")
+    bin_dir = pathlib.Path(sys.executable).parent
+    print(f"torchrun={bin_dir / 'torchrun' if (bin_dir / 'torchrun').exists() else shutil.which('torchrun') or ''}")
+    print(f"huggingface-cli={bin_dir / 'huggingface-cli' if (bin_dir / 'huggingface-cli').exists() else shutil.which('huggingface-cli') or ''}")
+    print(f"hf={bin_dir / 'hf' if (bin_dir / 'hf').exists() else shutil.which('hf') or ''}")
     try:
         import torch
 
@@ -313,7 +319,15 @@ def jobs(args: argparse.Namespace) -> int:
 
 
 def download(args: argparse.Namespace) -> int:
-    cmd = ["huggingface-cli", "download", args.model, "--local-dir", args.local_dir]
+    bin_dir = pathlib.Path(sys.executable).parent
+    hf = bin_dir / "hf"
+    huggingface_cli = bin_dir / "huggingface-cli"
+    if hf.exists():
+        cmd = [str(hf), "download", args.model, "--local-dir", args.local_dir]
+    elif huggingface_cli.exists():
+        cmd = [str(huggingface_cli), "download", args.model, "--local-dir", args.local_dir]
+    else:
+        cmd = [shutil.which("hf") or shutil.which("huggingface-cli") or "huggingface-cli", "download", args.model, "--local-dir", args.local_dir]
     print(command_string(cmd))
     if args.run:
         return subprocess.call(cmd)
