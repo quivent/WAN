@@ -7,16 +7,23 @@ import pathlib
 import platform
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
+from typing import Any
 
 
 DEFAULT_NATIVE_REPO = os.environ.get("WAN_NATIVE_REPO", "/opt/Wan2.2")
 DEFAULT_MODEL_DIR = os.environ.get("WAN_MODEL_DIR", "/models/Wan2.2-T2V-A14B")
-DEFAULT_OUTPUT_DIR = os.environ.get("WAN_OUTPUT_DIR", "outputs")
-DEFAULT_STATE_DIR = os.environ.get("WAN_STATE_DIR", ".wand")
+DEFAULT_OUTPUT_DIR = os.environ.get("WAN_OUTPUT_DIR", "/runs/wan/outputs" if pathlib.Path("/runs/wan").exists() else "outputs")
+DEFAULT_STATE_DIR = os.environ.get("WAN_STATE_DIR", "/runs/wan/.wand" if pathlib.Path("/runs/wan").exists() else ".wand")
+DEFAULT_COUNCIL_ROOT = os.environ.get("COUNCIL_ROOT", str(pathlib.Path.home() / "Council-of-Gemmas"))
+DEFAULT_RENDER_ROOT = os.environ.get("RENDER_ROOT", str(pathlib.Path.home() / "render"))
+DEFAULT_NEXUS_HOST = os.environ.get("NEXUS_HOST", "127.0.0.1")
+DEFAULT_NEXUS_PORT = int(os.environ.get("NEXUS_PORT", "9999"))
+DEFAULT_PIPER_SOCKET = os.environ.get("PIPER_SOCKET", "/tmp/piper.sock")
 
 MODEL_PRESETS = {
     "T2V": ("Wan-AI/Wan2.2-T2V-A14B", "/models/Wan2.2-T2V-A14B"),
@@ -119,6 +126,13 @@ def command_block(command: list[str] | str, label: str = "Command") -> None:
     print(f"  {paint(GOLD, '$ ')}{paint(TEAL + BOLD, text)}")
 
 
+def suite(name: str, color: str, rows: list[tuple[str, str]]) -> None:
+    print(paint(color, "▸ ") + paint(BOLD + color, name))
+    for index, (left, right) in enumerate(rows):
+        branch = "└─" if index == len(rows) - 1 else "├─"
+        print(f"  {paint(color, branch)} {paint(color, left.ljust(30))} {paint(DIM, right)}")
+
+
 def banner() -> None:
     print()
     print(paint(VIOLET, " __        ___    _   _ "))
@@ -129,6 +143,32 @@ def banner() -> None:
     print(paint(BOLD + VIOLET, "wan") + paint(DIM, "  enterprise GPU video forge"))
     print(paint(INDIGO, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
     print(paint(DIM, "  Native Wan2.2 · H200 queue worker · reproducible video jobs"))
+
+
+def palette(_: argparse.Namespace | None = None) -> int:
+    header("colors", "WAN terminal palette")
+    rows = [
+        ("violet", VIOLET, "kernel / primary headers"),
+        ("indigo", INDIGO, "runtime / rules"),
+        ("teal", TEAL, "forge / live command text"),
+        ("mint", MINT, "ready / complete / present"),
+        ("gold", GOLD, "prompt / synthesis / highlights"),
+        ("amber", AMBER, "queued / running / planned"),
+        ("rose", ROSE, "error / blocked state"),
+        ("ink-dim", SOFT, "descriptions and metadata"),
+    ]
+    for name, color, use in rows:
+        print(f"  {paint(color, '● ' + name).ljust(24)} {paint(DIM, use)}")
+    print()
+    suite("states", TEAL, [
+        ("present", state_text("present")),
+        ("ready", state_text("ready")),
+        ("queued", state_text("queued")),
+        ("running", state_text("running")),
+        ("done", state_text("done")),
+        ("failed", state_text("failed")),
+    ])
+    return 0
 
 
 def normalize_size(value: str) -> str:
@@ -207,6 +247,11 @@ def write_manifest(spec: JobSpec, command: list[str]) -> pathlib.Path:
     return manifest_path
 
 
+def safe_job_id(value: object) -> str:
+    text = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in {"-", "_"})
+    return text[:140] or f"wan-job-{int(time.time())}"
+
+
 def state_paths(state_dir: str = DEFAULT_STATE_DIR) -> dict[str, pathlib.Path]:
     root = pathlib.Path(state_dir).expanduser()
     return {
@@ -273,8 +318,12 @@ def run_spec(spec: JobSpec, dry_run: bool = False) -> int:
     )
     if dry_run:
         update_manifest(manifest_path, status="planned")
-        print(command_string(command))
-        print(f"manifest={manifest_path}")
+        header("run", "foreground WAN render plan")
+        kv("state", state_text("planned"))
+        kv("job id", spec.job_id)
+        kv("manifest", manifest_path)
+        kv("output", out_dir)
+        command_block(command)
         return 0
 
     stdout_path = out_dir / "stdout.log"
@@ -298,9 +347,12 @@ def run_spec(spec: JobSpec, dry_run: bool = False) -> int:
         stdout_log=str(stdout_path),
         stderr_log=str(stderr_path),
     )
-    print(f"job_id={spec.job_id}")
-    print(f"status={status}")
-    print(f"manifest={manifest_path}")
+    header("run", "foreground WAN render complete")
+    kv("job id", spec.job_id)
+    kv("status", state_text(status))
+    kv("manifest", manifest_path)
+    kv("stdout", stdout_path)
+    kv("stderr", stderr_path)
     return returncode
 
 
@@ -311,6 +363,157 @@ def git_sha() -> str:
         return "uncommitted"
 
 
+def nexus_request(payload: dict[str, Any], host: str = DEFAULT_NEXUS_HOST, port: int = DEFAULT_NEXUS_PORT, timeout: float = 2.5) -> dict[str, Any]:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as conn:
+            conn.settimeout(timeout)
+            conn.sendall((json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    data = conn.recv(65_536)
+                except TimeoutError:
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+                if b"\n" in data:
+                    break
+    except Exception as exc:
+        return {"schema": "council.nexus/v1", "service": "nexus", "ok": False, "status": "offline", "error": str(exc), "host": host, "port": port}
+    text = b"".join(chunks).decode("utf-8", "replace").strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"schema": "council.nexus/v1", "service": "nexus", "ok": False, "status": "invalid-response", "response": text}
+    return parsed if isinstance(parsed, dict) else {"schema": "council.nexus/v1", "service": "nexus", "ok": False, "status": "invalid-response", "response": text}
+
+
+def piper_request(payload: dict[str, Any], socket_path: str = DEFAULT_PIPER_SOCKET, timeout: float = 2.5) -> dict[str, Any]:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(socket_path)
+            conn.sendall((json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+            conn.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    data = conn.recv(65_536)
+                except TimeoutError:
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+                if b"\n" in data:
+                    break
+    except Exception as exc:
+        return {"schema": "council.piper/v1", "service": "piper", "ok": False, "status": "offline", "error": str(exc), "socket": socket_path}
+    text = b"".join(chunks).decode("utf-8", "replace").strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"schema": "council.piper/v1", "service": "piper", "ok": False, "status": "invalid-response", "response": text}
+    return parsed if isinstance(parsed, dict) else {"schema": "council.piper/v1", "service": "piper", "ok": False, "status": "invalid-response", "response": text}
+
+
+def council_available(root: str) -> bool:
+    return (pathlib.Path(root).expanduser() / "daemons" / "nexus.py").is_file()
+
+
+def nexus_job_payload(spec: JobSpec, queued_path: pathlib.Path, state_dir: str) -> dict[str, Any]:
+    job_id = spec.ensure_job_id()
+    output_dir = str(job_output_dir(spec))
+    manifest = {
+        "schema": "council.nexus.wan_manifest/v1",
+        "pipeline": "wan2.2-t2v",
+        "runner": "wan-enterprise-runner",
+        "generation": {
+            "task": spec.task,
+            "size": spec.size,
+            "gpus": spec.gpus,
+            "seed": spec.seed,
+            "prompt_extend": spec.use_prompt_extend,
+            "offload_model": spec.offload_model,
+            "convert_model_dtype": spec.convert_model_dtype,
+            "t5_cpu": spec.t5_cpu,
+        },
+        "required_assets": [
+            {"id": "wan-native-runtime", "path": str(pathlib.Path(spec.native_repo) / "generate.py")},
+            {"id": "wan-model", "path": spec.model_dir},
+        ],
+        "wan_queue_job": {
+            "state_dir": state_dir,
+            "queue_file": str(queued_path),
+            "output_dir": output_dir,
+            "command": command_string(native_command(spec)),
+        },
+    }
+    return {
+        "schema": "grid.visual.workflow.v1",
+        "job_id": job_id,
+        "id": job_id,
+        "kind": "nexus.wan.t2v",
+        "title": "WAN text-to-video render",
+        "lane": "wan-video",
+        "priority": 70,
+        "status": "queued",
+        "prompt": spec.prompt,
+        "brief": "WAN CLI queued this text-to-video job for the continuous H200 runner.",
+        "nexus_manifest": manifest,
+        "workflow": {
+            "intent": "wan.text_to_video.enterprise_gpu",
+            "stages": [
+                {"id": "manifest", "kind": "wan.manifest.create", "status": "done"},
+                {"id": "queue", "kind": "wan.queue.submit", "depends_on": ["manifest"]},
+                {"id": "video-generate", "kind": "video.generate", "model": "Wan2.2", "depends_on": ["queue"]},
+                {"id": "asset-return", "kind": "nexus.piper.materialize", "depends_on": ["video-generate"]},
+            ],
+            "models": {"primary_video_model": "Wan2.2", "policy": "wan-strict"},
+            "prompt": {"positive": spec.prompt},
+        },
+        "source": {"submitted_via": "wan render", "runner": "wan-enterprise-runner"},
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def publish_nexus_record(spec: JobSpec, queued_path: pathlib.Path, state_dir: str, args: argparse.Namespace) -> dict[str, Any]:
+    council_root = pathlib.Path(args.council_root).expanduser()
+    render_root = pathlib.Path(args.render_root).expanduser()
+    if not council_available(str(council_root)):
+        return {"ok": None, "status": "skipped", "reason": "Council-of-Gemmas not found", "council_root": str(council_root)}
+    health = nexus_request({"type": "health", "ts": time.time()}, host=args.nexus_host, port=args.nexus_port, timeout=args.nexus_timeout)
+    if not health.get("ok"):
+        return {"ok": False, "status": health.get("status") or "offline", "reason": health.get("error") or "Nexus is not reachable", "health": health}
+    job_id = spec.ensure_job_id()
+    state_root = council_root / "council_os" / "state" / "runtime" / "nexus" / "jobs" / job_id
+    queued_root = render_root / "grid" / "jobs" / "queued"
+    state_root.mkdir(parents=True, exist_ok=True)
+    queued_root.mkdir(parents=True, exist_ok=True)
+    job = nexus_job_payload(spec, queued_path, state_dir)
+    payload = json.dumps(job, indent=2, sort_keys=True) + "\n"
+    nexus_job = state_root / "job.json"
+    nexus_manifest = state_root / "manifest.json"
+    queued_spec = queued_root / f"{job_id}.json"
+    nexus_job.write_text(payload, encoding="utf-8")
+    nexus_manifest.write_text(json.dumps(job["nexus_manifest"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    queued_spec.write_text(payload, encoding="utf-8")
+    submit = nexus_request(
+        {"type": "submit", "job": {"job_id": job_id, "remote_path": str(queued_spec), "node": "local", "kind": "nexus.wan.t2v"}},
+        host=args.nexus_host,
+        port=args.nexus_port,
+        timeout=args.nexus_timeout,
+    )
+    return {
+        "ok": bool(submit.get("ok")),
+        "status": submit.get("status", "unknown"),
+        "job_id": job_id,
+        "queued_spec": str(queued_spec),
+        "state_dir": str(state_root),
+        "submit": submit,
+    }
+
+
 def doctor(_: argparse.Namespace) -> int:
     header("doctor", "WAN runtime readiness")
     kv("machine", platform.machine())
@@ -319,6 +522,8 @@ def doctor(_: argparse.Namespace) -> int:
     kv("native state", state_text("present" if pathlib.Path(DEFAULT_NATIVE_REPO).exists() else "missing"))
     kv("model dir", DEFAULT_MODEL_DIR)
     kv("model state", state_text("present" if pathlib.Path(DEFAULT_MODEL_DIR).exists() else "missing"))
+    kv("output dir", DEFAULT_OUTPUT_DIR)
+    kv("state dir", DEFAULT_STATE_DIR)
     bin_dir = pathlib.Path(sys.executable).parent
     kv("torchrun", bin_dir / "torchrun" if (bin_dir / "torchrun").exists() else shutil.which("torchrun") or "")
     kv("hf cli", bin_dir / "hf" if (bin_dir / "hf").exists() else shutil.which("hf") or "")
@@ -334,6 +539,49 @@ def doctor(_: argparse.Namespace) -> int:
         kv("torch", state_text("error"))
         kv("error", f"{type(exc).__name__}: {exc}")
         return 1
+    return 0
+
+
+def architecture(_: argparse.Namespace) -> int:
+    header("architecture", "WAN control plane")
+    kv("cli", "wan -> Python command router")
+    kv("native", DEFAULT_NATIVE_REPO)
+    kv("model", DEFAULT_MODEL_DIR)
+    kv("queue", DEFAULT_STATE_DIR)
+    kv("worker", "wan worker --state-dir " + DEFAULT_STATE_DIR)
+    kv("outputs", DEFAULT_OUTPUT_DIR)
+    print()
+    suite("request flow", TEAL, [
+        ("wan render", "queue a Wan2.2 T2V job for the continuous worker"),
+        ("wan render --wait", "queue and watch until done or failed"),
+        ("wan render --direct", "run native Wan2.2 in the foreground"),
+        ("wan render --plan", "show exact command without submitting"),
+        ("wan nexus status", "probe Council Nexus on 127.0.0.1:9999"),
+        ("wan piper status", "probe Council Piper on /tmp/piper.sock"),
+    ])
+    return 0
+
+
+def studio(_: argparse.Namespace) -> int:
+    header("studio", "H200 WAN runtime")
+    kv("native repo", DEFAULT_NATIVE_REPO)
+    kv("native state", state_text("present" if pathlib.Path(DEFAULT_NATIVE_REPO).exists() else "missing"))
+    kv("model dir", DEFAULT_MODEL_DIR)
+    kv("model state", state_text("present" if pathlib.Path(DEFAULT_MODEL_DIR).exists() else "missing"))
+    kv("state dir", DEFAULT_STATE_DIR)
+    kv("output dir", DEFAULT_OUTPUT_DIR)
+    nexus = nexus_request({"type": "health", "ts": time.time()}, timeout=1.0)
+    kv("nexus", state_text(str(nexus.get("status") or "offline")))
+    piper = piper_request({"type": "health", "ts": time.time()}, timeout=1.0)
+    kv("piper", state_text(str(piper.get("status") or "offline")))
+    print()
+    suite("commands", GOLD, [
+        ("download T2V", "download the text-to-video checkpoint"),
+        ("wan render \"prompt\"", "queue one video job"),
+        ("wan render \"prompt\" --wait", "queue and follow completion"),
+        ("wan jobs --verbose", "inspect queue files"),
+        ("wan worker", "run the queue loop in foreground"),
+    ])
     return 0
 
 
@@ -360,6 +608,91 @@ def enqueue(args: argparse.Namespace) -> int:
     kv("job id", spec.job_id)
     kv("queue file", path)
     kv("state dir", args.state_dir)
+    return 0
+
+
+def locate_job(job_id: str, state_dir: str) -> tuple[str, pathlib.Path] | None:
+    paths = state_paths(state_dir)
+    target = safe_job_id(job_id)
+    for name in ("running", "queue", "done", "failed"):
+        path = paths[name] / f"{target}.json"
+        if path.exists():
+            return name, path
+    for name in ("running", "queue", "done", "failed"):
+        matches = sorted(paths[name].glob(f"*{target}*.json"))
+        if matches:
+            return name, matches[-1]
+    return None
+
+
+def wait_for_job(job_id: str, state_dir: str, poll: float, timeout: float) -> int:
+    header("wait", "watching WAN queue")
+    kv("job id", job_id)
+    kv("state dir", state_dir)
+    deadline = time.time() + timeout if timeout > 0 else None
+    last_state = ""
+    while True:
+        found = locate_job(job_id, state_dir)
+        state = found[0] if found else "missing"
+        if state != last_state:
+            kv("state", state_text(state))
+            last_state = state
+        if state == "done":
+            return 0
+        if state == "failed":
+            return 1
+        if deadline is not None and time.time() >= deadline:
+            kv("timeout", state_text("failed"))
+            return 124
+        time.sleep(max(0.5, poll))
+
+
+def render(args: argparse.Namespace) -> int:
+    if not getattr(args, "job", None) and not str(args.prompt or "").strip():
+        raise SystemExit("wan render needs a prompt or --job")
+    spec = spec_from_args(args)
+    spec.ensure_job_id()
+    if args.plan:
+        command = native_command(spec)
+        header("render", "WAN job plan")
+        kv("state", state_text("planned"))
+        kv("job id", spec.job_id)
+        kv("task", spec.task)
+        kv("size", spec.size)
+        kv("gpus", spec.gpus)
+        kv("model", spec.model_dir)
+        kv("state dir", args.state_dir)
+        kv("output dir", spec.output_dir)
+        command_block(command)
+        return 0
+    if args.direct or args.now:
+        header("render", "running Wan2.2 in foreground")
+        kv("job id", spec.job_id)
+        kv("output dir", job_output_dir(spec))
+        return run_spec(spec, dry_run=False)
+
+    queued_path = queue_job(spec, args.state_dir)
+    header("render", "queued WAN video job")
+    kv("state", state_text("queued"))
+    kv("job id", spec.job_id)
+    kv("queue file", queued_path)
+    kv("state dir", args.state_dir)
+    kv("output dir", job_output_dir(spec))
+
+    publish = str(args.nexus).lower()
+    if publish != "off":
+        receipt = publish_nexus_record(spec, queued_path, args.state_dir, args)
+        if receipt.get("ok") or publish == "on":
+            kv("nexus", state_text(str(receipt.get("status") or "unknown")))
+            if receipt.get("queued_spec"):
+                kv("nexus spec", receipt["queued_spec"])
+        elif publish == "auto":
+            kv("nexus", state_text("skipped") + soft(f"  {receipt.get('reason') or receipt.get('status')}"))
+        if publish == "on" and not receipt.get("ok"):
+            return 1
+
+    if args.wait:
+        return wait_for_job(spec.job_id or "", args.state_dir, args.poll, args.timeout)
     return 0
 
 
@@ -404,6 +737,13 @@ def worker(args: argparse.Namespace) -> int:
 
 def jobs(args: argparse.Namespace) -> int:
     paths = ensure_state_dirs(args.state_dir)
+    if args.json:
+        payload = {
+            name: [str(path) for path in sorted(paths[name].glob("*.json"))[-args.limit:]]
+            for name in ("queue", "running", "done", "failed")
+        }
+        print(json.dumps({"state_dir": args.state_dir, "jobs": payload}, indent=2, sort_keys=True))
+        return 0
     header("jobs", "WAN queue state")
     kv("state dir", args.state_dir)
     for name in ("queue", "running", "done", "failed"):
@@ -413,6 +753,48 @@ def jobs(args: argparse.Namespace) -> int:
             for path in files[-args.limit:]:
                 print(f"    {paint(TEAL, str(path))}")
     return 0
+
+
+def nexus(args: argparse.Namespace) -> int:
+    command = getattr(args, "nexus_command", None) or "status"
+    if command in {"status", "health"}:
+        result = nexus_request({"type": "health", "ts": time.time()}, host=args.host, port=args.port, timeout=args.timeout)
+    elif command == "jobs":
+        result = nexus_request({"type": "jobs", "limit": args.limit, "job_id": args.job_id}, host=args.host, port=args.port, timeout=args.timeout)
+    else:
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("ok") else 1
+    header("nexus", "Council job daemon")
+    kv("status", state_text(str(result.get("status") or "unknown")))
+    kv("ok", state_text(str(bool(result.get("ok"))).lower()))
+    if result.get("host"):
+        kv("host", result.get("host"))
+    if result.get("port"):
+        kv("port", result.get("port"))
+    if result.get("piper_connected") is not None:
+        kv("piper", state_text("online" if result.get("piper_connected") else "offline"))
+    if result.get("queue_root"):
+        kv("queue root", result.get("queue_root"))
+    if isinstance(result.get("counts"), dict):
+        for key, value in result["counts"].items():
+            kv(str(key), value)
+    return 0 if result.get("ok") else 1
+
+
+def piper(args: argparse.Namespace) -> int:
+    result = piper_request({"type": "health", "ts": time.time()}, socket_path=args.socket, timeout=args.timeout)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("ok") else 1
+    header("piper", "Council asset materializer")
+    kv("status", state_text(str(result.get("status") or "unknown")))
+    kv("ok", state_text(str(bool(result.get("ok"))).lower()))
+    kv("socket", result.get("socket") or args.socket)
+    if result.get("asset_cache"):
+        kv("asset cache", result.get("asset_cache"))
+    return 0 if result.get("ok") else 1
 
 
 def resolve_model_target(target: str, model: str, local_dir: str) -> tuple[str, str]:
@@ -466,6 +848,24 @@ def add_download_args(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(func=download)
 
 
+def add_job_args(parser: argparse.ArgumentParser, *, state: bool = False) -> None:
+    parser.add_argument("prompt", nargs="?", default="")
+    parser.add_argument("--job", help="load a JSON job spec")
+    parser.add_argument("--task", default="t2v-A14B")
+    parser.add_argument("--size", default="1280x720")
+    parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--native-repo", default=DEFAULT_NATIVE_REPO)
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    if state:
+        parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--prompt-extend", action="store_true")
+    parser.add_argument("--t5-cpu", action="store_true")
+    parser.add_argument("--no-offload", action="store_true")
+    parser.add_argument("--no-convert-dtype", action="store_true")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wan", description="WAN enterprise GPU control CLI")
     sub = parser.add_subparsers(dest="command")
@@ -473,42 +873,42 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser("doctor")
     p_doctor.set_defaults(func=doctor)
 
+    p_arch = sub.add_parser("architecture", aliases=["arch"])
+    p_arch.set_defaults(func=architecture)
+
+    p_studio = sub.add_parser("studio", aliases=["status"])
+    p_studio.set_defaults(func=studio)
+
+    p_colors = sub.add_parser("colors", aliases=["theme"])
+    p_colors.set_defaults(func=palette)
+
     p_download = sub.add_parser("download")
     add_download_args(p_download)
 
     p_plan = sub.add_parser("plan")
-    p_plan.add_argument("prompt", nargs="?", default="")
-    p_plan.add_argument("--job", help="load a JSON job spec")
-    p_plan.add_argument("--task", default="t2v-A14B")
-    p_plan.add_argument("--size", default="1280x720")
-    p_plan.add_argument("--gpus", type=int, default=1)
-    p_plan.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
-    p_plan.add_argument("--native-repo", default=DEFAULT_NATIVE_REPO)
-    p_plan.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    p_plan.add_argument("--seed", type=int)
-    p_plan.add_argument("--prompt-extend", action="store_true")
-    p_plan.add_argument("--t5-cpu", action="store_true")
-    p_plan.add_argument("--no-offload", action="store_true")
-    p_plan.add_argument("--no-convert-dtype", action="store_true")
+    add_job_args(p_plan)
     p_plan.add_argument("--write-manifest", action="store_true")
     p_plan.set_defaults(func=plan)
 
     p_enqueue = sub.add_parser("enqueue")
-    p_enqueue.add_argument("prompt", nargs="?", default="")
-    p_enqueue.add_argument("--job", help="load a JSON job spec")
-    p_enqueue.add_argument("--task", default="t2v-A14B")
-    p_enqueue.add_argument("--size", default="1280x720")
-    p_enqueue.add_argument("--gpus", type=int, default=1)
-    p_enqueue.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
-    p_enqueue.add_argument("--native-repo", default=DEFAULT_NATIVE_REPO)
-    p_enqueue.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    p_enqueue.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
-    p_enqueue.add_argument("--seed", type=int)
-    p_enqueue.add_argument("--prompt-extend", action="store_true")
-    p_enqueue.add_argument("--t5-cpu", action="store_true")
-    p_enqueue.add_argument("--no-offload", action="store_true")
-    p_enqueue.add_argument("--no-convert-dtype", action="store_true")
+    add_job_args(p_enqueue, state=True)
     p_enqueue.set_defaults(func=enqueue)
+
+    p_render = sub.add_parser("render", aliases=["imagine", "forge"])
+    add_job_args(p_render, state=True)
+    p_render.add_argument("--plan", action="store_true", help="show the render plan without queueing")
+    p_render.add_argument("--direct", action="store_true", help="run native Wan2.2 in the foreground")
+    p_render.add_argument("--now", action="store_true", help="alias for --direct")
+    p_render.add_argument("--wait", action="store_true", help="wait for the queued job to finish")
+    p_render.add_argument("--poll", type=float, default=5.0, help="wait polling interval")
+    p_render.add_argument("--timeout", type=float, default=0.0, help="wait timeout in seconds; 0 means no timeout")
+    p_render.add_argument("--nexus", choices=["auto", "on", "off"], default="auto", help="publish Council Nexus job record")
+    p_render.add_argument("--council-root", default=DEFAULT_COUNCIL_ROOT)
+    p_render.add_argument("--render-root", default=DEFAULT_RENDER_ROOT)
+    p_render.add_argument("--nexus-host", default=DEFAULT_NEXUS_HOST)
+    p_render.add_argument("--nexus-port", type=int, default=DEFAULT_NEXUS_PORT)
+    p_render.add_argument("--nexus-timeout", type=float, default=2.5)
+    p_render.set_defaults(func=render)
 
     p_run_next = sub.add_parser("run-next")
     p_run_next.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
@@ -525,11 +925,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--stop-on-failure", action="store_true")
     p_worker.set_defaults(func=worker)
 
-    p_jobs = sub.add_parser("jobs")
+    p_jobs = sub.add_parser("jobs", aliases=["queue"])
     p_jobs.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     p_jobs.add_argument("--verbose", "-v", action="store_true")
     p_jobs.add_argument("--limit", type=int, default=20)
+    p_jobs.add_argument("--json", action="store_true")
     p_jobs.set_defaults(func=jobs)
+
+    p_nexus = sub.add_parser("nexus")
+    p_nexus.add_argument("nexus_command", nargs="?", choices=["status", "health", "jobs"], default="status")
+    p_nexus.add_argument("--host", default=DEFAULT_NEXUS_HOST)
+    p_nexus.add_argument("--port", type=int, default=DEFAULT_NEXUS_PORT)
+    p_nexus.add_argument("--timeout", type=float, default=2.5)
+    p_nexus.add_argument("--limit", type=int, default=80)
+    p_nexus.add_argument("--job-id", default="")
+    p_nexus.add_argument("--json", action="store_true")
+    p_nexus.set_defaults(func=nexus)
+
+    p_piper = sub.add_parser("piper")
+    p_piper.add_argument("piper_command", nargs="?", choices=["status", "health"], default="status")
+    p_piper.add_argument("--socket", default=DEFAULT_PIPER_SOCKET)
+    p_piper.add_argument("--timeout", type=float, default=2.5)
+    p_piper.add_argument("--json", action="store_true")
+    p_piper.set_defaults(func=piper)
 
     return parser
 
@@ -541,15 +959,27 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         banner()
         print()
-        print(paint(GOLD, "Commands"))
-        for left, right in [
+        suite("kernel", VIOLET, [
+            ("doctor", "inspect H200 runtime readiness"),
+            ("studio", "show paths, model state, Nexus, and Piper"),
+            ("architecture", "show CLI, queue, worker, and daemon flow"),
+            ("colors", "show the WAN terminal palette"),
             ("download T2V", "download text-to-video weights"),
-            ("wan doctor", "inspect H200 runtime readiness"),
-            ("wan plan \"prompt\"", "show native Wan2.2 command"),
-            ("wan enqueue \"prompt\"", "queue a continuous render job"),
-            ("wan jobs --verbose", "inspect queue state"),
-        ]:
-            print(f"  {paint(TEAL, left.ljust(24))} {paint(DIM, right)}")
+        ])
+        suite("forge", TEAL, [
+            ("render \"prompt\"", "queue a Wan2.2 video job"),
+            ("render \"prompt\" --wait", "queue and watch until completion"),
+            ("render \"prompt\" --direct", "run native Wan2.2 in foreground"),
+            ("plan \"prompt\"", "show exact native command"),
+            ("imagine / forge", "aliases for render"),
+        ])
+        suite("runtime", INDIGO, [
+            ("jobs --verbose", "inspect WAN queue state"),
+            ("worker", "run continuous H200 queue loop"),
+            ("run-next", "claim one queued job"),
+            ("nexus status", "probe Council Nexus"),
+            ("piper status", "probe Council Piper"),
+        ])
         return 0
     args = parser.parse_args(argv)
     return args.func(args)

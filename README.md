@@ -42,12 +42,13 @@ wan doctor
 Queue jobs:
 
 ```bash
-wan enqueue "a slow cinematic push through a rainy neon market" \
+wan render "a slow cinematic push through a rainy neon market" \
   --task t2v-A14B \
   --size 1280x720 \
   --gpus 1
 
-wan enqueue --job jobs/examples/t2v-720p.json
+wan render --job jobs/examples/t2v-720p.json
+wan render "a quiet spacecraft crossing a red storm" --wait
 wan jobs --verbose
 ```
 
@@ -90,7 +91,7 @@ this repo. Set:
 ```bash
 export WAN_NATIVE_REPO=/opt/Wan2.2
 export WAN_MODEL_DIR=/models/Wan2.2-T2V-A14B
-export WAN_OUTPUT_DIR=/runs/wan
+export WAN_OUTPUT_DIR=/runs/wan/outputs
 ```
 
 For an 8 GPU host, the planned command uses `torchrun` with FSDP and Ulysses.
@@ -117,10 +118,27 @@ native repo path, GPU count, command, git SHA, and created timestamp.
 
 ```bash
 wan doctor
+wan studio
+wan architecture
+wan colors
 download T2V
+wan render "prompt"
+wan render "prompt" --wait
+wan render "prompt" --plan
+wan render "prompt" --direct
+wan imagine "prompt"
+wan forge "prompt"
 wan plan "prompt" --task t2v-A14B --size 1280x720 --gpus 8
 wan plan --job jobs/examples/t2v-720p.json
 wan enqueue "prompt" --task t2v-A14B --size 1280x720 --gpus 1
 wan worker
 wan jobs --verbose
+wan queue
+wan nexus status
+wan nexus jobs
+wan piper status
 ```
+
+On a Council host, `wan render` queues the job for the WAN worker and publishes
+a Nexus-compatible job record when Nexus is reachable. Piper receives the
+queued-spec materialization request through Nexus.
