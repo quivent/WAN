@@ -24,6 +24,18 @@ MODEL_PRESETS = {
     "TI2V": ("Wan-AI/Wan2.2-TI2V-5B", "/models/Wan2.2-TI2V-5B"),
 }
 
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+VIOLET = "\033[38;5;141m"
+INDIGO = "\033[38;5;99m"
+TEAL = "\033[38;5;73m"
+MINT = "\033[38;5;121m"
+GOLD = "\033[38;5;220m"
+ROSE = "\033[38;5;204m"
+AMBER = "\033[38;5;214m"
+SOFT = "\033[38;5;246m"
+
 
 @dataclass
 class JobSpec:
@@ -52,6 +64,59 @@ class JobSpec:
 
 def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def color_enabled() -> bool:
+    if os.environ.get("WAN_FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE"):
+        return True
+    if os.environ.get("WAN_NO_COLOR") or os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(color: str, text: str) -> str:
+    if not color_enabled():
+        return text
+    return f"{color}{text}{RESET}"
+
+
+def strong(text: str) -> str:
+    return paint(BOLD, text)
+
+
+def soft(text: str) -> str:
+    return paint(SOFT, text)
+
+
+def state_text(value: str) -> str:
+    key = str(value).lower()
+    if key in {"ready", "present", "active", "done", "ok", "queued"}:
+        return paint(BOLD + MINT, value)
+    if key in {"planned", "downloading", "running", "pending"}:
+        return paint(BOLD + AMBER, value)
+    if key in {"missing", "failed", "error", "false"}:
+        return paint(BOLD + ROSE, value)
+    return paint(BOLD + TEAL, value)
+
+
+def header(title: str, subtitle: str = "") -> None:
+    print()
+    line = paint(BOLD + VIOLET, title)
+    if subtitle:
+        line += paint(DIM, f"  {subtitle}")
+    print(line)
+    print(paint(INDIGO, "-" * 60))
+
+
+def kv(name: str, value: object) -> None:
+    print(f"  {paint(SOFT, name.upper().ljust(18))} {value}")
+
+
+def command_block(command: list[str] | str, label: str = "Command") -> None:
+    text = command if isinstance(command, str) else command_string(command)
+    print()
+    print(paint(GOLD, label))
+    print(f"  {paint(TEAL + BOLD, text)}")
 
 
 def normalize_size(value: str) -> str:
@@ -235,26 +300,27 @@ def git_sha() -> str:
 
 
 def doctor(_: argparse.Namespace) -> int:
-    print(f"machine={platform.machine()}")
-    print(f"python={sys.executable}")
-    print(f"native_repo={DEFAULT_NATIVE_REPO}")
-    print(f"native_repo_exists={pathlib.Path(DEFAULT_NATIVE_REPO).exists()}")
-    print(f"model_dir={DEFAULT_MODEL_DIR}")
-    print(f"model_dir_exists={pathlib.Path(DEFAULT_MODEL_DIR).exists()}")
+    header("doctor", "WAN runtime readiness")
+    kv("machine", platform.machine())
+    kv("python", sys.executable)
+    kv("native repo", DEFAULT_NATIVE_REPO)
+    kv("native state", state_text("present" if pathlib.Path(DEFAULT_NATIVE_REPO).exists() else "missing"))
+    kv("model dir", DEFAULT_MODEL_DIR)
+    kv("model state", state_text("present" if pathlib.Path(DEFAULT_MODEL_DIR).exists() else "missing"))
     bin_dir = pathlib.Path(sys.executable).parent
-    print(f"torchrun={bin_dir / 'torchrun' if (bin_dir / 'torchrun').exists() else shutil.which('torchrun') or ''}")
-    print(f"huggingface-cli={bin_dir / 'huggingface-cli' if (bin_dir / 'huggingface-cli').exists() else shutil.which('huggingface-cli') or ''}")
-    print(f"hf={bin_dir / 'hf' if (bin_dir / 'hf').exists() else shutil.which('hf') or ''}")
+    kv("torchrun", bin_dir / "torchrun" if (bin_dir / "torchrun").exists() else shutil.which("torchrun") or "")
+    kv("hf cli", bin_dir / "hf" if (bin_dir / "hf").exists() else shutil.which("hf") or "")
     try:
         import torch
 
-        print(f"torch={torch.__version__}")
-        print(f"cuda_available={torch.cuda.is_available()}")
-        print(f"cuda_device_count={torch.cuda.device_count()}")
+        kv("torch", torch.__version__)
+        kv("cuda", state_text("ready" if torch.cuda.is_available() else "missing"))
+        kv("gpu count", torch.cuda.device_count())
         for i in range(torch.cuda.device_count()):
-            print(f"cuda_device_{i}={torch.cuda.get_device_name(i)}")
+            kv(f"gpu {i}", torch.cuda.get_device_name(i))
     except Exception as exc:
-        print(f"torch_error={type(exc).__name__}: {exc}")
+        kv("torch", state_text("error"))
+        kv("error", f"{type(exc).__name__}: {exc}")
         return 1
     return 0
 
@@ -262,17 +328,26 @@ def doctor(_: argparse.Namespace) -> int:
 def plan(args: argparse.Namespace) -> int:
     spec = spec_from_args(args)
     command = native_command(spec)
-    print(command_string(command))
+    header("plan", "native Wan2.2 command")
+    kv("task", spec.task)
+    kv("size", spec.size)
+    kv("gpus", spec.gpus)
+    kv("model", spec.model_dir)
+    kv("native repo", spec.native_repo)
+    command_block(command)
     if args.write_manifest:
-        print(f"manifest={write_manifest(spec, command)}")
+        kv("manifest", write_manifest(spec, command))
     return 0
 
 
 def enqueue(args: argparse.Namespace) -> int:
     spec = spec_from_args(args)
     path = queue_job(spec, args.state_dir)
-    print(f"job_id={spec.job_id}")
-    print(f"queued={path}")
+    header("enqueue", "queued WAN render job")
+    kv("state", state_text("queued"))
+    kv("job id", spec.job_id)
+    kv("queue file", path)
+    kv("state dir", args.state_dir)
     return 0
 
 
@@ -281,7 +356,8 @@ def run_next(args: argparse.Namespace) -> int:
     queued = sorted(paths["queue"].glob("*.json"))
     if not queued:
         if not args.quiet:
-            print("queue=empty")
+            header("run-next", "queue check")
+            kv("state", state_text("empty"))
         return 0
 
     queued_path = queued[0]
@@ -296,8 +372,9 @@ def run_next(args: argparse.Namespace) -> int:
 
 def worker(args: argparse.Namespace) -> int:
     processed = 0
-    print(f"state_dir={args.state_dir}")
-    print(f"poll_seconds={args.poll}")
+    header("worker", "continuous WAN queue runner")
+    kv("state dir", args.state_dir)
+    kv("poll", f"{args.poll}s")
     while True:
         paths = ensure_state_dirs(args.state_dir)
         if not any(paths["queue"].glob("*.json")):
@@ -315,12 +392,14 @@ def worker(args: argparse.Namespace) -> int:
 
 def jobs(args: argparse.Namespace) -> int:
     paths = ensure_state_dirs(args.state_dir)
+    header("jobs", "WAN queue state")
+    kv("state dir", args.state_dir)
     for name in ("queue", "running", "done", "failed"):
         files = sorted(paths[name].glob("*.json"))
-        print(f"{name}={len(files)}")
+        kv(name, state_text(str(len(files))) if files else "0")
         if args.verbose:
             for path in files[-args.limit:]:
-                print(f"  {path}")
+                print(f"    {paint(TEAL, str(path))}")
     return 0
 
 
@@ -351,16 +430,18 @@ def download(args: argparse.Namespace) -> int:
         cmd = [str(huggingface_cli), "download", model, "--local-dir", local_dir]
     else:
         cmd = [shutil.which("hf") or shutil.which("huggingface-cli") or "huggingface-cli", "download", model, "--local-dir", local_dir]
-    print(f"target={str(args.target or 'T2V').upper()}")
-    print(f"model={model}")
-    print(f"local_dir={local_dir}")
+    target = str(args.target or "T2V").upper()
+    header("download", "WAN model weights")
+    kv("target", target)
+    kv("model", model)
+    kv("directory", local_dir)
     if args.plan:
-        print("state=planned")
-        print(f"run=download {str(args.target or 'T2V').upper()}")
-        print(f"command={command_string(cmd)}")
+        kv("state", state_text("planned"))
+        command_block(f"download {target}", "Run")
+        command_block(cmd)
         return 0
-    print("state=downloading")
-    print(f"command={command_string(cmd)}")
+    kv("state", state_text("downloading"))
+    command_block(cmd)
     return subprocess.call(cmd)
 
 
