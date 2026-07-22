@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-wan = "wan.cli:main"
+wan = "wanctl.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["wan*"]
+include = ["wanctl*"]

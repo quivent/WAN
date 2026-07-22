@@ -28,19 +28,19 @@ setup:
 	$(VENV_PY) -m pip install -e .
 
 doctor:
-	$(VENV_PY) -m wan.cli doctor
+	$(VENV_PY) -m wanctl.cli doctor
 
 plan:
-	$(VENV_PY) -m wan.cli plan "$(PROMPT)" --task $(TASK) --size $(SIZE) --gpus $(GPUS)
+	$(VENV_PY) -m wanctl.cli plan "$(PROMPT)" --task $(TASK) --size $(SIZE) --gpus $(GPUS)
 
 enqueue:
-	$(VENV_PY) -m wan.cli enqueue "$(PROMPT)" --task $(TASK) --size $(SIZE) --gpus $(GPUS)
+	$(VENV_PY) -m wanctl.cli enqueue "$(PROMPT)" --task $(TASK) --size $(SIZE) --gpus $(GPUS)
 
 worker:
-	$(VENV_PY) -m wan.cli worker
+	$(VENV_PY) -m wanctl.cli worker
 
 jobs:
-	$(VENV_PY) -m wan.cli jobs --verbose
+	$(VENV_PY) -m wanctl.cli jobs --verbose
 
 check:
-	$(PYTHON) -m compileall -q wan
+	$(PYTHON) -m compileall -q wanctl
