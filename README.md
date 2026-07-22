@@ -121,6 +121,7 @@ wan doctor
 wan studio
 wan architecture
 wan colors
+wan gallery --open
 download T2V
 wan render "prompt"
 wan render "prompt" --wait
@@ -134,6 +135,7 @@ wan enqueue "prompt" --task t2v-A14B --size 1280x720 --gpus 1
 wan worker
 wan jobs --verbose
 wan queue
+wan gallery --addr 0.0.0.0:7862
 wan nexus status
 wan nexus jobs
 wan piper status

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
+import mimetypes
 import os
 import pathlib
 import platform
@@ -11,6 +13,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
+import webbrowser
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -219,6 +223,13 @@ def native_command(spec: JobSpec) -> list[str]:
 def command_string(parts: list[str]) -> str:
     special = set(" \t\n*?[];$&(){}<>|\"'`")
     return " ".join(shell_quote(p) if any(ch in special for ch in p) else p for p in parts)
+
+
+def parse_addr(value: str) -> tuple[str, int]:
+    if ":" not in value:
+        return value, 7862
+    host, raw_port = value.rsplit(":", 1)
+    return host or "127.0.0.1", int(raw_port)
 
 
 def load_job(path: str) -> JobSpec:
@@ -755,6 +766,215 @@ def jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+MEDIA_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def read_json(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def media_kind(path: pathlib.Path) -> str:
+    if path.suffix.lower() in {".mp4", ".webm", ".mov", ".mkv"}:
+        return "video"
+    return "image"
+
+
+def collect_media(output_root: pathlib.Path, job_id: str) -> list[dict[str, str]]:
+    root = output_root.expanduser() / job_id
+    if not root.is_dir():
+        return []
+    items: list[dict[str, str]] = []
+    for path in sorted(root.rglob("*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+        if path.is_file() and path.suffix.lower() in MEDIA_EXTS:
+            rel = path.relative_to(output_root.expanduser())
+            items.append({
+                "name": path.name,
+                "kind": media_kind(path),
+                "path": str(path),
+                "url": "/outputs/" + "/".join(urllib.parse.quote(part) for part in rel.parts),
+            })
+    return items[:24]
+
+
+def collect_gallery_jobs(state_dir: str, output_dir: str, limit: int = 80) -> dict[str, Any]:
+    paths = ensure_state_dirs(state_dir)
+    output_root = pathlib.Path(output_dir).expanduser()
+    jobs_out: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for state in ("running", "queue", "done", "failed"):
+        files = sorted(paths[state].glob("*.json"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        counts[state] = len(files)
+        for path in files[:limit]:
+            spec = read_json(path)
+            job_id = safe_job_id(spec.get("job_id") or path.stem)
+            manifest = read_json(output_root / job_id / "manifest.json")
+            status = str(manifest.get("status") or state)
+            media = collect_media(output_root, job_id)
+            jobs_out.append({
+                "id": job_id,
+                "status": status,
+                "queue_state": state,
+                "prompt": spec.get("prompt") or manifest.get("prompt") or "",
+                "task": spec.get("task") or manifest.get("task") or "",
+                "size": spec.get("size") or manifest.get("size") or "",
+                "gpus": spec.get("gpus") or manifest.get("gpus") or 1,
+                "seed": spec.get("seed") if spec.get("seed") is not None else manifest.get("seed"),
+                "output_dir": str(output_root / job_id),
+                "manifest": str(output_root / job_id / "manifest.json"),
+                "updated": path.stat().st_mtime if path.exists() else 0,
+                "media": media,
+                "primary_url": media[0]["url"] if media else "",
+                "primary_kind": media[0]["kind"] if media else "",
+            })
+    jobs_out.sort(key=lambda item: float(item.get("updated") or 0), reverse=True)
+    return {"ok": True, "state_dir": state_dir, "output_dir": output_dir, "counts": counts, "jobs": jobs_out[:limit]}
+
+
+def gallery_html() -> str:
+    return r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WAN gallery</title>
+<style>
+:root{--bg:#060810;--panel:#0d101d;--panel2:#12182a;--text:#ede6d8;--muted:#aeb5c4;--quiet:#6f788b;--line:rgba(237,230,216,.13);--violet:#b48eff;--teal:#64c8ff;--mint:#8dffbd;--gold:#ffd580;--rose:#ff9fb7;--amber:#ffbf72;--shadow:0 18px 60px rgba(0,0,0,.34)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:linear-gradient(180deg,#060810,#0b0e1b 52%,#111426);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0;-webkit-font-smoothing:antialiased}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(255,159,183,.08),transparent 28%,rgba(100,200,255,.07) 74%,transparent),linear-gradient(180deg,rgba(255,213,128,.045),transparent 34%)}
+a{color:inherit}.top{position:sticky;top:0;z-index:4;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:end;padding:22px clamp(18px,4vw,44px);background:rgba(6,8,16,.82);backdrop-filter:blur(16px);border-bottom:1px solid var(--line)}
+.mark{color:var(--gold);font:700 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase;letter-spacing:.12em}.title{margin-top:7px;color:var(--violet);font-size:clamp(30px,5vw,62px);font-weight:800;line-height:.95}.sub{max-width:860px;color:var(--muted);margin-top:8px}.status{display:flex;gap:8px;align-items:center;justify-content:flex-end;color:var(--muted);white-space:nowrap}.dot{width:9px;height:9px;border-radius:50%;background:var(--rose);box-shadow:0 0 18px rgba(255,159,183,.55)}.dot.on{background:var(--mint);box-shadow:0 0 18px rgba(141,255,189,.45)}
+main{padding:18px clamp(18px,4vw,44px) 42px}.metrics{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-bottom:16px}.metric{border:1px solid var(--line);border-radius:8px;background:rgba(13,16,29,.72);padding:12px}.metric b{display:block;color:var(--gold);font-size:22px}.metric span{display:block;color:var(--quiet);font:700 10px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase;margin-top:5px}
+.jobs{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}.job{min-width:0;border:1px solid var(--line);border-radius:8px;background:rgba(13,16,29,.74);box-shadow:var(--shadow);overflow:hidden}.preview{position:relative;aspect-ratio:16/9;background:#050711;display:grid;place-items:center;color:var(--quiet)}.preview img,.preview video{width:100%;height:100%;object-fit:cover;display:block}.preview .placeholder{padding:18px;text-align:center;color:var(--quiet)}.body{padding:12px}.row{display:flex;align-items:center;gap:8px;justify-content:space-between}.job b{min-width:0;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.state{border:1px solid rgba(255,213,128,.18);border-radius:999px;padding:4px 7px;color:var(--gold);font:700 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase;background:rgba(255,213,128,.055);white-space:nowrap}.prompt{margin-top:9px;color:var(--muted);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:60px}.facts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}.facts span{border:1px solid rgba(100,200,255,.16);border-radius:999px;padding:4px 7px;color:var(--teal);font:700 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;background:rgba(100,200,255,.045)}.links{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:rgba(18,24,42,.8);color:var(--text);text-decoration:none;font-size:12px}.button.primary{border-color:rgba(255,213,128,.28);color:var(--gold)}.empty{border:1px dashed var(--line);border-radius:8px;color:var(--muted);padding:24px;text-align:center;background:rgba(13,16,29,.52)}
+@media(max-width:720px){.top{grid-template-columns:1fr}.status{justify-content:flex-start}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.jobs{grid-template-columns:1fr}.title{font-size:36px}}
+</style>
+</head>
+<body>
+<div class="top"><div><div class="mark">WAN · enterprise video archive</div><div class="title">Render gallery</div><div class="sub">Live H200 queue and output wall for Wan2.2 jobs. The page streams job state and lights up media as files land in the output directory.</div></div><div class="status"><i id="dot" class="dot"></i><span id="status">connecting</span></div></div>
+<main>
+<section id="metrics" class="metrics"></section>
+<section id="jobs" class="jobs"><div class="empty">Loading gallery</div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),escAttr=s=>esc(s).replace(/"/g,'&quot;');
+function setState(ok,msg){$('dot').classList.toggle('on',!!ok);$('status').textContent=msg}
+function metrics(c){c=c||{};$('metrics').innerHTML=['running','queue','done','failed'].map(k=>'<div class="metric"><b>'+esc(c[k]||0)+'</b><span>'+esc(k)+'</span></div>').join('')}
+function preview(j){if(j.primary_url&&j.primary_kind==='video')return '<video src="'+escAttr(j.primary_url)+'" muted loop playsinline controls></video>';if(j.primary_url)return '<img src="'+escAttr(j.primary_url)+'" alt="">';return '<div class="placeholder">Waiting for media</div>'}
+function jobHTML(j){const facts=[j.task,j.size,(j.gpus?j.gpus+' gpu':''),(j.seed!==null&&j.seed!==undefined?'seed '+j.seed:'')].filter(Boolean);let links='';if(j.primary_url)links+='<a class="button primary" href="'+escAttr(j.primary_url)+'" target="_blank" rel="noreferrer">Open media</a>';if(j.manifest)links+='<a class="button" href="'+escAttr('/outputs/'+j.id+'/manifest.json')+'" target="_blank" rel="noreferrer">Manifest</a>';return '<article class="job"><div class="preview">'+preview(j)+'</div><div class="body"><div class="row"><b title="'+escAttr(j.id)+'">'+esc(j.id)+'</b><span class="state">'+esc(j.queue_state||j.status||'')+'</span></div><div class="prompt">'+esc(j.prompt||'No prompt recorded')+'</div><div class="facts">'+facts.map(x=>'<span>'+esc(x)+'</span>').join('')+'</div><div class="links">'+links+'</div></div></article>'}
+function render(data){metrics(data.counts);const jobs=data.jobs||[];$('jobs').innerHTML=jobs.map(jobHTML).join('')||'<div class="empty">No WAN jobs yet.</div>'}
+async function load(){const r=await fetch('/api/jobs');const j=await r.json();render(j);setState(true,'snapshot ready')}
+function connect(){if(!window.EventSource){load().catch(e=>setState(false,e.message));return}const es=new EventSource('/api/jobs/events');es.addEventListener('jobs',ev=>{try{render(JSON.parse(ev.data));setState(true,'stream live')}catch(_){setState(false,'stream parse error')}});es.onerror=()=>{setState(false,'stream reconnecting')};setTimeout(()=>load().catch(()=>{}),1000)}
+connect();
+</script>
+</body>
+</html>
+"""
+
+
+class GalleryHandler(http.server.BaseHTTPRequestHandler):
+    state_dir = DEFAULT_STATE_DIR
+    output_dir = DEFAULT_OUTPUT_DIR
+    event_poll = 2.0
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+    def send_json(self, payload: dict[str, Any], code: int = 200) -> None:
+        data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in {"/", "/gallery"}:
+            data = gallery_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if parsed.path == "/api/jobs":
+            self.send_json(collect_gallery_jobs(self.state_dir, self.output_dir))
+            return
+        if parsed.path == "/api/jobs/events":
+            self.stream_jobs()
+            return
+        if parsed.path.startswith("/outputs/"):
+            self.serve_output(parsed.path)
+            return
+        self.send_json({"ok": False, "error": "not found"}, code=404)
+
+    def stream_jobs(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        last = ""
+        while True:
+            payload = collect_gallery_jobs(self.state_dir, self.output_dir)
+            data = json.dumps(payload, sort_keys=True)
+            if data != last:
+                try:
+                    self.wfile.write(f"event: jobs\ndata: {data}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except OSError:
+                    return
+                last = data
+            time.sleep(self.event_poll)
+
+    def serve_output(self, path: str) -> None:
+        rel = urllib.parse.unquote(path.removeprefix("/outputs/"))
+        root = pathlib.Path(self.output_dir).expanduser().resolve()
+        target = (root / rel).resolve()
+        if root != target and root not in target.parents:
+            self.send_json({"ok": False, "error": "invalid output path"}, code=400)
+            return
+        if not target.is_file():
+            self.send_json({"ok": False, "error": "missing output"}, code=404)
+            return
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(target.stat().st_size))
+        self.end_headers()
+        with target.open("rb") as src:
+            shutil.copyfileobj(src, self.wfile)
+
+
+def gallery(args: argparse.Namespace) -> int:
+    host, port = parse_addr(args.addr)
+    handler = type("ConfiguredGalleryHandler", (GalleryHandler,), {
+        "state_dir": args.state_dir,
+        "output_dir": args.output_dir,
+        "event_poll": args.poll,
+    })
+    server = http.server.ThreadingHTTPServer((host, port), handler)
+    url = f"http://{host}:{port}/gallery"
+    header("gallery", "WAN live output wall")
+    kv("url", url)
+    kv("state dir", args.state_dir)
+    kv("output dir", args.output_dir)
+    kv("stream", "/api/jobs/events")
+    if args.open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        server.server_close()
+    return 0
+
+
 def nexus(args: argparse.Namespace) -> int:
     command = getattr(args, "nexus_command", None) or "status"
     if command in {"status", "health"}:
@@ -882,6 +1102,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_colors = sub.add_parser("colors", aliases=["theme"])
     p_colors.set_defaults(func=palette)
 
+    p_gallery = sub.add_parser("gallery", aliases=["view"])
+    p_gallery.add_argument("--addr", default="127.0.0.1:7862")
+    p_gallery.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
+    p_gallery.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    p_gallery.add_argument("--poll", type=float, default=2.0)
+    p_gallery.add_argument("--open", action="store_true")
+    p_gallery.set_defaults(func=gallery)
+
     p_download = sub.add_parser("download")
     add_download_args(p_download)
 
@@ -964,6 +1192,7 @@ def main(argv: list[str] | None = None) -> int:
             ("studio", "show paths, model state, Nexus, and Piper"),
             ("architecture", "show CLI, queue, worker, and daemon flow"),
             ("colors", "show the WAN terminal palette"),
+            ("gallery --open", "start the live output wall"),
             ("download T2V", "download text-to-video weights"),
         ])
         suite("forge", TEAL, [
@@ -975,6 +1204,7 @@ def main(argv: list[str] | None = None) -> int:
         ])
         suite("runtime", INDIGO, [
             ("jobs --verbose", "inspect WAN queue state"),
+            ("gallery --addr 0.0.0.0:7862", "serve queue and media stream"),
             ("worker", "run continuous H200 queue loop"),
             ("run-next", "claim one queued job"),
             ("nexus status", "probe Council Nexus"),
