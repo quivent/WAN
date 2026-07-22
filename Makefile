@@ -1,6 +1,6 @@
 SHELL := /bin/zsh
 
-PYTHON ?= python3.13
+PYTHON ?= python3
 UV ?= uv
 VENV ?= .venv
 PROMPT ?= a slow cinematic push through a rainy neon market
