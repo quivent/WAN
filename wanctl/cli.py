@@ -8,14 +8,16 @@ import os
 import pathlib
 import platform
 import random
+import re
 import shutil
 import socket
+import signal
 import subprocess
 import sys
 import time
 import urllib.parse
 import webbrowser
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 
@@ -32,6 +34,27 @@ MODEL_PRESETS = {
     "I2V": ("Wan-AI/Wan2.2-I2V-A14B", "/models/Wan2.2-I2V-A14B"),
     "TI2V": ("Wan-AI/Wan2.2-TI2V-5B", "/models/Wan2.2-TI2V-5B"),
 }
+
+NATIVE_T2V_SIZES = {"720x1280", "1280x720", "480x832", "832x480", "704x1280", "1280x704", "1024x704", "704x1024"}
+
+ENVISION_PRESETS: dict[str, dict[str, Any]] = {
+    "vertical": {"size": "480x832", "frame_num": 121, "fps": 24, "sample_steps": 4, "sample_guide_scale": "1.0", "sample_shift": 5.0},
+    "square-loop": {"size": "832x480", "frame_num": 81, "fps": 16, "sample_steps": 4, "sample_guide_scale": "1.0", "native_note": "native Wan2.2 generate.py does not accept square sizes"},
+    "ultrawide": {"size": "832x480", "frame_num": 97, "fps": 24, "sample_steps": 4, "sample_guide_scale": "1.0", "sample_shift": 5.0, "native_note": "snapped from Envision 960x416 to native 832x480"},
+    "drone-aerial": {"size": "832x480", "frame_num": 97, "fps": 24, "sample_steps": 4, "sample_guide_scale": "1.0", "sample_shift": 5.0},
+    "slowmo-macro": {"size": "832x480", "frame_num": 81, "fps": 8, "sample_steps": 4, "sample_guide_scale": "1.0", "sample_shift": 5.0, "native_note": "native Wan2.2 generate.py does not accept square sizes"},
+    "time-lapse": {"size": "832x480", "frame_num": 81, "fps": 60, "sample_steps": 4, "sample_guide_scale": "1.0"},
+    "wide": {"size": "832x480", "frame_num": 81, "fps": 24, "sample_steps": 6, "sample_guide_scale": "1.0", "sample_shift": 5.0},
+    "sketch": {"size": "832x480", "frame_num": 33, "fps": 16, "sample_steps": 2, "sample_guide_scale": "1.0", "native_note": "native Wan2.2 generate.py does not accept 480x480"},
+    "hero": {"size": "1280x720", "frame_num": 81, "fps": 24, "sample_steps": 30, "sample_guide_scale": "5.0", "sample_shift": 5.0},
+}
+
+ENVISION_DEFAULT_NEGATIVE = (
+    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
+    "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
+    "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
+    "杂乱的背景，三条腿，背景人很多，倒着走，裸露，NSFW"
+)
 
 
 def valid_native_repo(path: str) -> bool:
@@ -110,8 +133,12 @@ class JobSpec:
     seed: int | None = None
     use_prompt_extend: bool = False
     convert_model_dtype: bool = True
-    offload_model: bool = True
+    offload_model: bool = False
     t5_cpu: bool = False
+    preset: str | None = None
+    fps: int | None = None
+    pass_split: float | None = None
+    negative: str | None = None
     frame_num: int | None = None
     sample_solver: str | None = None
     sample_steps: int | None = None
@@ -341,7 +368,10 @@ def parse_addr(value: str) -> tuple[str, int]:
 
 def load_job(path: str) -> JobSpec:
     data = json.loads(pathlib.Path(path).read_text())
-    return JobSpec(**data)
+    if isinstance(data.get("envision"), dict):
+        data.update({key: value for key, value in data["envision"].items() if key in {"preset", "fps", "pass_split", "negative"}})
+    allowed = {item.name for item in fields(JobSpec)}
+    return JobSpec(**{key: value for key, value in data.items() if key in allowed})
 
 
 def write_manifest(spec: JobSpec, command: list[str]) -> pathlib.Path:
@@ -378,6 +408,7 @@ def state_paths(state_dir: str = DEFAULT_STATE_DIR) -> dict[str, pathlib.Path]:
         "running": root / "running",
         "done": root / "done",
         "failed": root / "failed",
+        "metadata": root / "metadata",
     }
 
 
@@ -389,24 +420,50 @@ def ensure_state_dirs(state_dir: str = DEFAULT_STATE_DIR) -> dict[str, pathlib.P
 
 
 def spec_from_args(args: argparse.Namespace) -> JobSpec:
-    return load_job(args.job) if getattr(args, "job", None) else JobSpec(
+    if getattr(args, "job", None):
+        return load_job(args.job)
+    preset_name = str(getattr(args, "preset", "") or "").strip()
+    preset = ENVISION_PRESETS.get(preset_name)
+    size = args.size
+    frame_num = args.frame_num
+    fps = args.fps
+    sample_steps = args.sample_steps
+    sample_shift = args.sample_shift
+    sample_guide_scale = args.sample_guide_scale
+    if preset:
+        size = size if args.size != "1280x720" else str(preset.get("size") or size)
+        frame_num = frame_num if frame_num is not None else preset.get("frame_num")
+        fps = fps if fps is not None else preset.get("fps")
+        sample_steps = sample_steps if sample_steps is not None else preset.get("sample_steps")
+        sample_shift = sample_shift if sample_shift is not None else preset.get("sample_shift")
+        sample_guide_scale = sample_guide_scale if sample_guide_scale is not None else preset.get("sample_guide_scale")
+    normalized_size = str(size).replace("*", "x")
+    if str(args.task).lower() in {"t2v-a14b", "i2v-a14b", "ti2v-5b"} and normalized_size not in NATIVE_T2V_SIZES:
+        accepted = ", ".join(sorted(NATIVE_T2V_SIZES))
+        raise SystemExit(f"native Wan2.2 generate.py does not accept {normalized_size}; use one of: {accepted}")
+    size = normalized_size
+    return JobSpec(
         prompt=args.prompt,
         task=args.task,
-        size=args.size,
+        size=size,
         gpus=args.gpus,
         model_dir=args.model_dir,
         native_repo=args.native_repo,
         output_dir=args.output_dir,
         seed=args.seed,
         use_prompt_extend=args.prompt_extend,
-        offload_model=not args.no_offload,
+        offload_model=bool(args.offload) and not args.no_offload,
         convert_model_dtype=not args.no_convert_dtype,
         t5_cpu=args.t5_cpu,
-        frame_num=args.frame_num,
+        preset=preset_name or None,
+        fps=fps,
+        pass_split=args.pass_split,
+        negative=args.negative,
+        frame_num=frame_num,
         sample_solver=args.sample_solver,
-        sample_steps=args.sample_steps,
-        sample_shift=args.sample_shift,
-        sample_guide_scale=args.sample_guide_scale,
+        sample_steps=sample_steps,
+        sample_shift=sample_shift,
+        sample_guide_scale=sample_guide_scale,
         save_file=args.save_file,
         image=args.image,
         prompt_extend_method=args.prompt_extend_method,
@@ -433,12 +490,28 @@ def queue_job(spec: JobSpec, state_dir: str = DEFAULT_STATE_DIR) -> pathlib.Path
     paths = ensure_state_dirs(state_dir)
     job_id = spec.ensure_job_id()
     path = paths["queue"] / f"{job_id}.json"
-    path.write_text(json.dumps(asdict(spec), indent=2, sort_keys=True) + "\n")
+    payload = asdict(spec)
+    meta = {
+        key: payload.pop(key, None)
+        for key in ("preset", "fps", "pass_split", "negative")
+        if payload.get(key) is not None and payload.get(key) != ""
+    }
+    if meta:
+        meta_dir = paths["metadata"]
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        (meta_dir / f"{job_id}.json").write_text(json.dumps({"job_id": job_id, "envision": meta}, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return path
 
 
 def job_output_dir(spec: JobSpec) -> pathlib.Path:
     return pathlib.Path(spec.output_dir).expanduser() / spec.ensure_job_id()
+
+
+def prepare_spec_defaults(spec: JobSpec) -> None:
+    job_id = spec.ensure_job_id()
+    if not spec.save_file:
+        spec.save_file = str(pathlib.Path(spec.output_dir).expanduser() / job_id / f"{job_id}.mp4")
 
 
 def update_manifest(path: pathlib.Path, **updates: object) -> None:
@@ -448,10 +521,10 @@ def update_manifest(path: pathlib.Path, **updates: object) -> None:
 
 
 def run_spec(spec: JobSpec, dry_run: bool = False) -> int:
-    spec.ensure_job_id()
-    command = native_command(spec)
+    prepare_spec_defaults(spec)
     out_dir = job_output_dir(spec)
     out_dir.mkdir(parents=True, exist_ok=True)
+    command = native_command(spec)
     manifest_path = write_manifest(spec, command)
     update_manifest(
         manifest_path,
@@ -712,6 +785,9 @@ def studio(_: argparse.Namespace) -> int:
     kv("model state", state_text("present" if pathlib.Path(DEFAULT_MODEL_DIR).exists() else "missing"))
     kv("state dir", DEFAULT_STATE_DIR)
     kv("output dir", DEFAULT_OUTPUT_DIR)
+    stack = model_stack(DEFAULT_MODEL_DIR)
+    kv("model stack", state_text("ready" if stack["ready"] else "missing"))
+    kv("lightning lora", state_text("present" if stack["optional"]["lightning_lora_present"] else "missing"))
     nexus = nexus_request({"type": "health", "ts": time.time()}, timeout=1.0)
     kv("nexus", state_text(str(nexus.get("status") or "offline")))
     piper = piper_request({"type": "health", "ts": time.time()}, timeout=1.0)
@@ -719,9 +795,11 @@ def studio(_: argparse.Namespace) -> int:
     print()
     suite("commands", GOLD, [
         ("download T2V", "download the text-to-video checkpoint"),
+        ("wan stack", "inspect T5/VAE/high-noise/low-noise model stack"),
         ("wan render \"prompt\"", "queue one video job"),
+        ("wan render --preset wide", "apply Envision geometry/sampling defaults"),
         ("wan render \"prompt\" --wait", "queue and follow completion"),
-        ("wan jobs --verbose", "inspect queue files"),
+        ("wan pipeline", "inspect ETA, stages, failures, and controls"),
         ("wan worker", "run the queue loop in foreground"),
     ])
     return 0
@@ -743,16 +821,18 @@ def runtime_config() -> dict[str, Any]:
             "sample_steps": "native default unless set",
             "sample_shift": "native default unless set",
             "sample_guide_scale": "native default unless set",
-            "offload_model": True,
+            "offload_model": False,
             "convert_model_dtype": True,
             "t5_cpu": False,
             "prompt_extend": False,
         },
+        "envision_presets": ENVISION_PRESETS,
+        "model_stack": model_stack(DEFAULT_MODEL_DIR),
         "precision": {
             "text_encoder": "bf16 checkpoint: models_t5_umt5-xxl-enc-bf16.pth",
             "model_param_dtype": "bf16 from native Wan2.2 config",
             "convert_model_dtype": "enabled by default; pass --no-convert-dtype to disable",
-            "offload_model": "enabled by default; pass --no-offload to disable",
+            "offload_model": "disabled by default for H200; pass --offload to trade speed for lower VRAM",
         },
         "env_file": "/etc/wan.env",
     }
@@ -772,12 +852,114 @@ def config_cmd(args: argparse.Namespace) -> int:
     suite("precision", GOLD, [(key, str(value)) for key, value in cfg["precision"].items()])
     print()
     suite("configure", INDIGO, [
-        ("render flags", "--size --gpus --model-dir --native-repo --output-dir --state-dir --no-offload --no-convert-dtype --t5-cpu"),
+        ("render flags", "--size --gpus --model-dir --native-repo --output-dir --state-dir --offload --no-convert-dtype --t5-cpu"),
         ("custom dimensions", "--frame-num --sample-steps --sample-shift --sample-guide-scale --sample-solver --extra-arg"),
         ("service env", "edit /etc/wan.env, then sudo systemctl restart wan-worker"),
         ("worker user", "wan-worker.service runs as ubuntu so CLI queue writes remain valid"),
     ])
     return 0
+
+
+def bytes_label(value: int) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+        size /= 1024
+
+
+def stack_entry(root: pathlib.Path, role: str, rel: str, kind: str) -> dict[str, Any]:
+    path = root / rel
+    files = [p for p in path.rglob("*") if p.is_file()] if path.is_dir() else ([path] if path.is_file() else [])
+    total = sum(p.stat().st_size for p in files if p.exists())
+    return {
+        "role": role,
+        "kind": kind,
+        "path": str(path),
+        "present": bool(path.exists()),
+        "files": len(files),
+        "bytes": total,
+        "size": bytes_label(total) if total else "0B",
+    }
+
+
+def discover_lightning_stacks() -> list[dict[str, Any]]:
+    roots = [
+        pathlib.Path("/models"),
+        pathlib.Path.home() / "models",
+        pathlib.Path("/home/ubuntu/models"),
+    ]
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            name = path.name.lower()
+            parent = str(path.parent)
+            if "wan2.2" not in parent.lower() and "wan2.2" not in name:
+                continue
+            if "lora" not in parent.lower() and "lora" not in name and "light" not in parent.lower() and "light" not in name:
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"role": "lightning_lora", "kind": "optional_accelerator", "path": key, "present": True, "size": bytes_label(path.stat().st_size)})
+    return found[:24]
+
+
+def model_stack(model_dir: str, task: str = "t2v-A14B") -> dict[str, Any]:
+    root = pathlib.Path(model_dir).expanduser()
+    vae_name = "Wan2.2_VAE.pth" if str(task).lower().startswith("ti2v") else "Wan2.1_VAE.pth"
+    entries = [
+        stack_entry(root, "text_encoder", "models_t5_umt5-xxl-enc-bf16.pth", "umt5_xxl_bf16"),
+        stack_entry(root, "tokenizer", "google/umt5-xxl", "sentencepiece"),
+        stack_entry(root, "vae", vae_name, "wan_vae"),
+        stack_entry(root, "high_noise_transformer", "high_noise_model", "moe_transformer"),
+        stack_entry(root, "low_noise_transformer", "low_noise_model", "moe_transformer"),
+    ]
+    lightning = discover_lightning_stacks()
+    return {
+        "task": task,
+        "model_dir": str(root),
+        "present": root.is_dir(),
+        "ready": root.is_dir() and all(entry["present"] for entry in entries if entry["role"] != "tokenizer"),
+        "entries": entries,
+        "optional": {
+            "lightning_lora": lightning,
+            "lightning_lora_present": bool(lightning),
+        },
+        "envision_parity": {
+            "native_stack": "T5 + VAE + high-noise transformer + low-noise transformer",
+            "diffusers_stack": "Envision also models CLIP/T5, VAE, high/low UNet, and optional high/low Lightning LoRAs",
+            "lora_fast_path": "present" if lightning else "not detected on this host",
+        },
+    }
+
+
+def stack_cmd(args: argparse.Namespace) -> int:
+    stack = model_stack(args.model_dir, args.task)
+    if args.json:
+        print(json.dumps(stack, indent=2, sort_keys=True))
+        return 0 if stack.get("ready") else 1
+    header("stack", "WAN model stack")
+    kv("task", stack["task"])
+    kv("model dir", stack["model_dir"])
+    kv("ready", state_text("ready" if stack["ready"] else "missing"))
+    print()
+    for entry in stack["entries"]:
+        status = state_text("present" if entry["present"] else "missing")
+        print(f"  {soft(str(entry['role']).ljust(24))} {status.ljust(18)} {soft(str(entry['kind']).ljust(20))} {paint(TEAL, entry['size'].rjust(9))}  {soft(entry['path'])}")
+    lightning = stack["optional"]["lightning_lora"]
+    print()
+    if lightning:
+        suite("optional Lightning LoRA", GOLD, [(pathlib.Path(item["path"]).name, item["size"]) for item in lightning])
+    else:
+        suite("optional Lightning LoRA", ROSE, [("not detected", "Envision fast-path LoRA stack is not installed on this host")])
+    return 0 if stack.get("ready") else 1
 
 
 def gpu(args: argparse.Namespace) -> int:
@@ -827,6 +1009,7 @@ def gpu(args: argparse.Namespace) -> int:
 
 def plan(args: argparse.Namespace) -> int:
     spec = spec_from_args(args)
+    prepare_spec_defaults(spec)
     command = native_command(spec)
     header("plan", "native Wan2.2 command")
     kv("task", spec.task)
@@ -842,6 +1025,7 @@ def plan(args: argparse.Namespace) -> int:
 
 def enqueue(args: argparse.Namespace) -> int:
     spec = spec_from_args(args)
+    prepare_spec_defaults(spec)
     path = queue_job(spec, args.state_dir)
     header("enqueue", "queued WAN render job")
     kv("state", state_text("queued"))
@@ -891,7 +1075,7 @@ def render(args: argparse.Namespace) -> int:
     if not getattr(args, "job", None) and not str(args.prompt or "").strip():
         raise SystemExit("wan render needs a prompt or --job")
     spec = spec_from_args(args)
-    spec.ensure_job_id()
+    prepare_spec_defaults(spec)
     if args.plan:
         command = native_command(spec)
         header("render", "WAN job plan")
@@ -1018,13 +1202,45 @@ def output_manifest(spec: dict[str, Any]) -> dict[str, Any]:
 
 def job_record(path: pathlib.Path, state: str) -> dict[str, Any]:
     spec = read_json(path)
+    meta = read_json(path.parent.parent / "metadata" / path.name)
+    if isinstance(meta.get("envision"), dict):
+        spec.update({key: value for key, value in meta["envision"].items() if key in {"preset", "fps", "pass_split", "negative"}})
     manifest = output_manifest(spec)
     merged = {**spec, **manifest}
     merged["state"] = state
     merged["state_file"] = str(path)
     merged["job_id"] = safe_job_id(merged.get("job_id") or path.stem)
     merged["output_path"] = str(pathlib.Path(str(merged.get("output_dir") or DEFAULT_OUTPUT_DIR)).expanduser() / merged["job_id"])
+    merged["model_stack"] = model_stack(str(merged.get("model_dir") or DEFAULT_MODEL_DIR), str(merged.get("task") or "t2v-A14B"))
+    merged["pipeline_stages"] = pipeline_stages_for_job(merged)
+    merged["estimate_seconds"] = estimate_job_seconds(merged)
+    merged["progress"] = job_progress(merged)
     return merged
+
+
+def parse_size_pixels(value: object) -> int:
+    text = str(value or "1280x720").replace("*", "x").lower()
+    try:
+        w_raw, h_raw = text.split("x", 1)
+        return max(1, int(w_raw) * int(h_raw))
+    except Exception:
+        return 1280 * 720
+
+
+def estimate_job_seconds(record: dict[str, Any]) -> float:
+    frames = int(record.get("frame_num") or record.get("frames") or 81)
+    steps = int(record.get("sample_steps") or record.get("steps") or 30)
+    pixels = parse_size_pixels(record.get("size"))
+    area_factor = max(0.45, pixels / float(1280 * 720))
+    gpus = max(1, int(record.get("gpus") or 1))
+    gpu_factor = 1.0 / min(gpus, 8) ** 0.78
+    offload_factor = 1.15 if record.get("offload_model", True) else 0.92
+    dtype_factor = 1.0 if record.get("convert_model_dtype", True) else 1.2
+    # Native Wan2.2 on the current H200 path is materially slower than the
+    # Envision diffusers+Lightning browser estimate. This rate makes 81f x
+    # 30-step 720p land near the observed 15m band until local history exists.
+    seconds_per_step_frame = 0.37
+    return max(45.0, steps * frames * seconds_per_step_frame * area_factor * gpu_factor * offload_factor * dtype_factor)
 
 
 def duration_estimate(records: list[dict[str, Any]], fallback: float = 900.0) -> float:
@@ -1034,7 +1250,8 @@ def duration_estimate(records: list[dict[str, Any]], fallback: float = 900.0) ->
         if duration and duration > 0 and str(record.get("state")).lower() == "done"
     ]
     if not samples:
-        return fallback
+        active_estimates = [float(record.get("estimate_seconds") or 0) for record in records if float(record.get("estimate_seconds") or 0) > 0]
+        return active_estimates[0] if active_estimates else fallback
     samples = sorted(samples[-12:])
     return samples[len(samples) // 2]
 
@@ -1047,6 +1264,14 @@ def collect_job_records(paths: dict[str, pathlib.Path], limit: int) -> dict[str,
         ]
         for name in ("queue", "running", "done", "failed")
     }
+
+
+def find_record(job_id: str, state_dir: str = DEFAULT_STATE_DIR) -> dict[str, Any] | None:
+    found = locate_job(job_id, state_dir)
+    if not found:
+        return None
+    state, path = found
+    return job_record(path, state)
 
 
 def job_failure_reason(record: dict[str, Any]) -> str:
@@ -1066,6 +1291,105 @@ def job_failure_reason(record: dict[str, Any]) -> str:
     return "failed without a recorded error"
 
 
+TQDM_RE = re.compile(r"(?P<pct>\d+)%\|.*?\|\s*(?P<step>\d+)/(?:\s*)?(?P<total>\d+)\s*\[(?P<elapsed>\d+):(?P<elapsed_s>\d+)<(?P<remaining>\d+):(?P<remaining_s>\d+)")
+
+
+def job_progress(record: dict[str, Any]) -> dict[str, Any]:
+    stderr = pathlib.Path(str(record.get("stderr_log") or pathlib.Path(str(record.get("output_path") or "")) / "stderr.log"))
+    progress: dict[str, Any] = {"step": None, "total": int(record.get("sample_steps") or record.get("steps") or 0) or None, "percent": None, "eta_seconds": None}
+    if not stderr.is_file():
+        return progress
+    text = stderr.read_text(encoding="utf-8", errors="replace")[-20000:]
+    matches = list(TQDM_RE.finditer(text.replace("\r", "\n")))
+    if not matches:
+        return progress
+    match = matches[-1]
+    step = int(match.group("step"))
+    total = int(match.group("total"))
+    remaining = int(match.group("remaining")) * 60 + int(match.group("remaining_s"))
+    progress.update({
+        "step": step,
+        "total": total,
+        "percent": int(match.group("pct")),
+        "eta_seconds": remaining,
+    })
+    return progress
+
+
+def write_state_record(record: dict[str, Any], state_dir: str, target_state: str) -> pathlib.Path:
+    paths = ensure_state_dirs(state_dir)
+    state_file = pathlib.Path(str(record.get("state_file") or ""))
+    payload = {key: value for key, value in record.items() if key not in {"state", "state_file", "output_path"}}
+    payload["job_id"] = safe_job_id(payload.get("job_id") or state_file.stem)
+    target = paths[target_state] / f"{payload['job_id']}.json"
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    if state_file.exists() and state_file != target:
+        state_file.unlink()
+    return target
+
+
+def update_output_manifest(record: dict[str, Any], **updates: object) -> None:
+    job_id = safe_job_id(record.get("job_id"))
+    output_path = pathlib.Path(str(record.get("output_path") or ""))
+    manifest = output_path / "manifest.json"
+    if not manifest.is_file():
+        output_dir = pathlib.Path(str(record.get("output_dir") or DEFAULT_OUTPUT_DIR)).expanduser()
+        manifest = output_dir / job_id / "manifest.json"
+    if manifest.is_file():
+        data = read_json(manifest)
+        data.update(updates)
+        manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def running_generate_pids(record: dict[str, Any]) -> list[int]:
+    prompt = str(record.get("prompt") or "")
+    model_dir = str(record.get("model_dir") or "")
+    try:
+        output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if "generate.py" not in line or "Wan2.2" not in line:
+            continue
+        if prompt and prompt not in line:
+            continue
+        if model_dir and model_dir not in line:
+            continue
+        raw_pid = line.split(None, 1)[0]
+        try:
+            pids.append(int(raw_pid))
+        except ValueError:
+            continue
+    return pids
+
+
+def terminate_pids(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        alive = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        if not alive:
+            return
+        time.sleep(0.25)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def job_seed(record: dict[str, Any]) -> str:
     return str(record.get("seed")) if record.get("seed") is not None else "-"
 
@@ -1083,8 +1407,26 @@ def job_flags(record: dict[str, Any]) -> str:
     return ",".join(flags)
 
 
+def pipeline_stages_for_job(record: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = int(record.get("sample_steps") or record.get("steps") or 30)
+    split = float(record.get("pass_split") or 0.5)
+    high_steps = max(1, min(steps - 1, round(steps * max(0.1, min(0.9, split))))) if steps > 1 else steps
+    low_steps = max(0, steps - high_steps)
+    stack = record.get("model_stack") if isinstance(record.get("model_stack"), dict) else {}
+    stack_ready = bool(stack.get("ready"))
+    state = str(record.get("state") or "queue")
+    sampling_status = "running" if state == "running" else "queued" if state == "queue" else state
+    return [
+        {"id": "stack", "label": "Resolve model stack", "status": "ready" if stack_ready else "missing", "detail": "T5 + VAE + high-noise + low-noise"},
+        {"id": "encode", "label": "Prompt encode", "status": sampling_status, "detail": "umt5_xxl bf16"},
+        {"id": "high_noise", "label": "High-noise composition pass", "status": sampling_status, "steps": high_steps, "detail": f"{high_steps}/{steps} steps"},
+        {"id": "low_noise", "label": "Low-noise finishing pass", "status": sampling_status, "steps": low_steps, "detail": f"{low_steps}/{steps} steps"},
+        {"id": "decode", "label": "VAE decode and write media", "status": sampling_status, "detail": str(record.get("save_file") or "native output")},
+    ]
+
+
 def print_table_header() -> None:
-    print(f"  {soft('POS'.ljust(4))} {soft('STATE'.ljust(9))} {soft('ETA'.rjust(6))} {soft('ELAPSED'.rjust(8))} {soft('TASK'.ljust(9))} {soft('SIZE'.ljust(9))} {soft('SEED'.ljust(8))} {soft('RUNTIME'.ljust(24))} JOB")
+    print(f"  {soft('POS'.ljust(4))} {soft('STATE'.ljust(9))} {soft('ETA'.rjust(7))} {soft('ELAPSED'.rjust(8))} {soft('STEP'.ljust(8))} {soft('TASK'.ljust(9))} {soft('SIZE'.ljust(9))} {soft('SEED'.ljust(8))} {soft('STACK'.ljust(9))} {soft('RUNTIME'.ljust(24))} JOB")
 
 
 def print_pipeline_row(pos: int, record: dict[str, Any], estimate: float, queued_ahead: float, verbose: bool) -> float:
@@ -1093,27 +1435,41 @@ def print_pipeline_row(pos: int, record: dict[str, Any], estimate: float, queued
     prompt = str(record.get("prompt") or "").strip()
     started = parse_ts(record.get("started_at") or record.get("created_at"))
     elapsed = max(0.0, time.time() - started) if started and state == "running" else None
-    eta = max(0.0, estimate - (elapsed or 0.0)) if state == "running" else queued_ahead + estimate
-    eta_text = duration_label(eta) if state in {"queue", "running"} else "-"
+    own_estimate = float(record.get("estimate_seconds") or estimate)
+    overrun = bool(state == "running" and elapsed is not None and elapsed > own_estimate)
+    eta = max(0.0, own_estimate - (elapsed or 0.0)) if state == "running" else queued_ahead + own_estimate
+    progress = record.get("progress") if isinstance(record.get("progress"), dict) else {}
+    progress_eta = progress.get("eta_seconds") if isinstance(progress.get("eta_seconds"), (int, float)) else None
+    eta_text = duration_label(float(progress_eta)) if state == "running" and progress_eta is not None else ("overrun" if overrun else (duration_label(eta) if state in {"queue", "running"} else "-"))
+    if overrun:
+        record["estimate_overrun"] = True
     elapsed_text = duration_label(elapsed) if elapsed is not None else "-"
+    step_text = f"{progress.get('step')}/{progress.get('total')}" if progress.get("step") is not None and progress.get("total") is not None else "-"
+    stack = record.get("model_stack") if isinstance(record.get("model_stack"), dict) else {}
+    stack_text = "ready" if stack.get("ready") else "missing"
     print(
         "  "
         + soft(str(pos).ljust(4))
         + f" {state_text(state).ljust(18)}"
-        + f" {paint(GOLD, eta_text.rjust(6))}"
+        + f" {paint(GOLD, eta_text.rjust(7))}"
         + f" {soft(elapsed_text.rjust(8))}"
+        + f" {soft(step_text.ljust(8))}"
         + f" {soft(str(record.get('task') or 't2v-A14B').ljust(9))}"
         + f" {soft(str(record.get('size') or '').ljust(9))}"
         + f" {soft(job_seed(record).ljust(8))}"
+        + f" {state_text(stack_text).ljust(18)}"
         + f" {soft(job_flags(record)[:24].ljust(24))}"
         + f" {paint(TEAL, job_id)}"
     )
     if prompt:
         print(f"       {soft(prompt[:150])}")
     if verbose:
+        for stage in record.get("pipeline_stages") or []:
+            print(f"       {soft(str(stage.get('id')).ljust(12))} {state_text(str(stage.get('status') or '')).ljust(18)} {soft(str(stage.get('detail') or ''))}")
+    if verbose:
         print(f"       {soft(str(record.get('output_path') or ''))}")
         print(f"       {soft(str(record.get('state_file') or ''))}")
-    return eta if state == "queue" else queued_ahead
+    return queued_ahead + own_estimate if state == "queue" else queued_ahead
 
 
 def print_history_row(record: dict[str, Any], verbose: bool) -> None:
@@ -1135,8 +1491,121 @@ def print_history_row(record: dict[str, Any], verbose: bool) -> None:
         print(f"       {soft(str(record.get('state_file') or ''))}")
 
 
+def pipeline_logs(record: dict[str, Any], lines: int) -> int:
+    header("pipeline logs", safe_job_id(record.get("job_id")))
+    for label, key in (("stdout", "stdout_log"), ("stderr", "stderr_log")):
+        path = pathlib.Path(str(record.get(key) or pathlib.Path(str(record.get("output_path") or "")) / f"{label}.log"))
+        kv(label, path)
+        if not path.is_file():
+            print(f"  {soft('not written yet')}")
+            continue
+        text_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        print()
+        print(paint(GOLD, label))
+        for line in text_lines[-max(1, lines):]:
+            print("  " + line)
+    return 0
+
+
+def pipeline_cancel(record: dict[str, Any], state_dir: str) -> int:
+    state = str(record.get("state") or "")
+    job_id = safe_job_id(record.get("job_id"))
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if state == "queue":
+        record["status"] = "cancelled"
+        record["error"] = "cancelled by operator before worker claim"
+        record["finished_at"] = now
+        target = write_state_record(record, state_dir, "failed")
+        update_output_manifest(record, status="cancelled", error=record["error"], finished_at=now)
+        header("pipeline cancel", "queued job cancelled")
+        kv("job id", job_id)
+        kv("state file", target)
+        return 0
+    if state == "running":
+        pids = running_generate_pids(record)
+        record["status"] = "cancel_requested"
+        record["error"] = "cancelled by operator"
+        update_output_manifest(record, status="cancel_requested", error=record["error"], cancel_requested_at=now)
+        if pids:
+            terminate_pids(pids)
+        target = write_state_record({**record, "status": "cancelled", "finished_at": now}, state_dir, "failed")
+        header("pipeline cancel", "running job cancelled")
+        kv("job id", job_id)
+        kv("pids", ", ".join(str(pid) for pid in pids) if pids else "none matched")
+        kv("state file", target)
+        return 0
+    header("pipeline cancel", "nothing to cancel")
+    kv("job id", job_id)
+    kv("state", state_text(state))
+    return 1
+
+
+def pipeline_retry(record: dict[str, Any], state_dir: str, same_id: bool) -> int:
+    spec = {key: value for key, value in record.items() if key not in {
+        "state", "state_file", "output_path", "model_stack", "pipeline_stages", "estimate_seconds",
+        "status", "returncode", "seconds", "started_at", "finished_at", "stdout_log", "stderr_log", "error",
+        "command", "command_string", "git_sha", "created_at",
+    }}
+    if not same_id:
+        spec["job_id"] = None
+    next_spec = JobSpec(**spec)
+    path = queue_job(next_spec, state_dir)
+    header("pipeline retry", "job requeued")
+    kv("source", safe_job_id(record.get("job_id")))
+    kv("job id", next_spec.job_id)
+    kv("queue file", path)
+    return 0
+
+
+def pipeline_remove(record: dict[str, Any], outputs: bool) -> int:
+    state_file = pathlib.Path(str(record.get("state_file") or ""))
+    output_path = pathlib.Path(str(record.get("output_path") or ""))
+    removed: list[str] = []
+    if state_file.is_file():
+        state_file.unlink()
+        removed.append(str(state_file))
+    if outputs and output_path.exists():
+        shutil.rmtree(output_path)
+        removed.append(str(output_path))
+    header("pipeline remove", safe_job_id(record.get("job_id")))
+    for item in removed:
+        kv("removed", item)
+    if not removed:
+        kv("removed", "nothing")
+    return 0
+
+
+def pipeline_clear_failed(state_dir: str) -> int:
+    paths = ensure_state_dirs(state_dir)
+    count = 0
+    for path in paths["failed"].glob("*.json"):
+        path.unlink()
+        count += 1
+    header("pipeline clear-failed", "failure markers removed")
+    kv("removed", count)
+    return 0
+
+
 def pipeline_cmd(args: argparse.Namespace) -> int:
     paths = ensure_state_dirs(args.state_dir)
+    action = getattr(args, "pipeline_action", None) or "view"
+    if action == "clear-failed":
+        return pipeline_clear_failed(args.state_dir)
+    if action != "view":
+        if not args.job_id:
+            raise SystemExit(f"wan pipeline {action} needs a job id")
+        record = find_record(args.job_id, args.state_dir)
+        if not record:
+            raise SystemExit(f"WAN job not found: {args.job_id}")
+        if action == "cancel":
+            return pipeline_cancel(record, args.state_dir)
+        if action == "retry":
+            return pipeline_retry(record, args.state_dir, args.same_id)
+        if action == "remove":
+            return pipeline_remove(record, args.outputs)
+        if action == "logs":
+            return pipeline_logs(record, args.lines)
+        raise SystemExit(f"unknown pipeline action: {action}")
     records = collect_job_records(paths, args.limit)
     all_records = [record for values in records.values() for record in values]
     estimate = duration_estimate(all_records)
@@ -1502,8 +1971,13 @@ def add_job_args(parser: argparse.ArgumentParser, *, state: bool = False) -> Non
     parser.add_argument("--seed", type=int)
     parser.add_argument("--prompt-extend", action="store_true")
     parser.add_argument("--t5-cpu", action="store_true")
-    parser.add_argument("--no-offload", action="store_true")
+    parser.add_argument("--offload", action="store_true", help="enable CPU offload; slower, but uses less VRAM")
+    parser.add_argument("--no-offload", action="store_true", help="force no CPU offload; retained for compatibility")
     parser.add_argument("--no-convert-dtype", action="store_true")
+    parser.add_argument("--preset", choices=sorted(ENVISION_PRESETS), help="apply Envision studio geometry/sampling defaults")
+    parser.add_argument("--fps", type=int, help="record intended output FPS for ETA/gallery metadata")
+    parser.add_argument("--pass-split", type=float, help="record high/low-noise split used by Envision-style planning")
+    parser.add_argument("--negative", default="", help="record negative prompt metadata; native Wan2.2 generate.py does not consume it")
     parser.add_argument("--frame-num", type=int)
     parser.add_argument("--sample-solver", choices=["unipc", "dpm++"])
     parser.add_argument("--sample-steps", type=int)
@@ -1549,6 +2023,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_config = sub.add_parser("config", aliases=["defaults", "vars"])
     p_config.add_argument("--json", action="store_true")
     p_config.set_defaults(func=config_cmd)
+
+    p_stack = sub.add_parser("stack", aliases=["models", "model-stack"])
+    p_stack.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    p_stack.add_argument("--task", default="t2v-A14B")
+    p_stack.add_argument("--json", action="store_true")
+    p_stack.set_defaults(func=stack_cmd)
 
     p_gpu = sub.add_parser("gpu", aliases=["gpus", "nvidia"])
     p_gpu.add_argument("--json", action="store_true")
@@ -1614,11 +2094,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_jobs.set_defaults(func=jobs)
 
     p_pipeline = sub.add_parser("pipeline", aliases=["pipe"])
+    p_pipeline.add_argument("pipeline_action", nargs="?", choices=["view", "cancel", "retry", "remove", "logs", "clear-failed"], default="view")
+    p_pipeline.add_argument("job_id", nargs="?")
     p_pipeline.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     p_pipeline.add_argument("--verbose", "-v", action="store_true")
     p_pipeline.add_argument("--limit", type=int, default=20)
     p_pipeline.add_argument("--json", action="store_true")
     p_pipeline.add_argument("--failed", type=int, default=3, help="show this many recent failures below the active line; 0 hides them")
+    p_pipeline.add_argument("--lines", type=int, default=80, help="lines to show for pipeline logs")
+    p_pipeline.add_argument("--same-id", action="store_true", help="retry with the same job id instead of minting a new id")
+    p_pipeline.add_argument("--outputs", action="store_true", help="with remove, also delete the output directory")
     p_pipeline.set_defaults(func=pipeline_cmd)
 
     p_nexus = sub.add_parser("nexus")
