@@ -15,7 +15,7 @@ import sys
 import time
 import urllib.parse
 import webbrowser
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -112,6 +112,30 @@ class JobSpec:
     convert_model_dtype: bool = True
     offload_model: bool = True
     t5_cpu: bool = False
+    frame_num: int | None = None
+    sample_solver: str | None = None
+    sample_steps: int | None = None
+    sample_shift: float | None = None
+    sample_guide_scale: str | None = None
+    save_file: str | None = None
+    image: str | None = None
+    prompt_extend_method: str | None = None
+    prompt_extend_model: str | None = None
+    prompt_extend_target_lang: str | None = None
+    src_root_path: str | None = None
+    refert_num: int | None = None
+    replace_flag: bool = False
+    use_relighting_lora: bool = False
+    num_clip: int | None = None
+    audio: str | None = None
+    enable_tts: bool = False
+    tts_prompt_audio: str | None = None
+    tts_prompt_text: str | None = None
+    tts_text: str | None = None
+    pose_video: str | None = None
+    start_from_ref: bool = False
+    infer_frames: int | None = None
+    extra_args: list[str] = field(default_factory=list)
 
     def ensure_job_id(self) -> str:
         if self.job_id:
@@ -255,6 +279,40 @@ def native_command(spec: JobSpec) -> list[str]:
         base += ["--use_prompt_extend"]
     if spec.seed is not None:
         base += ["--base_seed", str(spec.seed)]
+    optional = [
+        ("--frame_num", spec.frame_num),
+        ("--sample_solver", spec.sample_solver),
+        ("--sample_steps", spec.sample_steps),
+        ("--sample_shift", spec.sample_shift),
+        ("--sample_guide_scale", spec.sample_guide_scale),
+        ("--save_file", spec.save_file),
+        ("--image", spec.image),
+        ("--prompt_extend_method", spec.prompt_extend_method),
+        ("--prompt_extend_model", spec.prompt_extend_model),
+        ("--prompt_extend_target_lang", spec.prompt_extend_target_lang),
+        ("--src_root_path", spec.src_root_path),
+        ("--refert_num", spec.refert_num),
+        ("--num_clip", spec.num_clip),
+        ("--audio", spec.audio),
+        ("--tts_prompt_audio", spec.tts_prompt_audio),
+        ("--tts_prompt_text", spec.tts_prompt_text),
+        ("--tts_text", spec.tts_text),
+        ("--pose_video", spec.pose_video),
+        ("--infer_frames", spec.infer_frames),
+    ]
+    for flag, value in optional:
+        if value is not None and value != "":
+            base += [flag, str(value)]
+    if spec.replace_flag:
+        base += ["--replace_flag"]
+    if spec.use_relighting_lora:
+        base += ["--use_relighting_lora"]
+    if spec.enable_tts:
+        base += ["--enable_tts"]
+    if spec.start_from_ref:
+        base += ["--start_from_ref"]
+    if spec.extra_args:
+        base += [str(part) for part in spec.extra_args]
 
     if spec.gpus <= 1:
         return [python, *base]
@@ -344,6 +402,30 @@ def spec_from_args(args: argparse.Namespace) -> JobSpec:
         offload_model=not args.no_offload,
         convert_model_dtype=not args.no_convert_dtype,
         t5_cpu=args.t5_cpu,
+        frame_num=args.frame_num,
+        sample_solver=args.sample_solver,
+        sample_steps=args.sample_steps,
+        sample_shift=args.sample_shift,
+        sample_guide_scale=args.sample_guide_scale,
+        save_file=args.save_file,
+        image=args.image,
+        prompt_extend_method=args.prompt_extend_method,
+        prompt_extend_model=args.prompt_extend_model,
+        prompt_extend_target_lang=args.prompt_extend_target_lang,
+        src_root_path=args.src_root_path,
+        refert_num=args.refert_num,
+        replace_flag=args.replace_flag,
+        use_relighting_lora=args.use_relighting_lora,
+        num_clip=args.num_clip,
+        audio=args.audio,
+        enable_tts=args.enable_tts,
+        tts_prompt_audio=args.tts_prompt_audio,
+        tts_prompt_text=args.tts_prompt_text,
+        tts_text=args.tts_text,
+        pose_video=args.pose_video,
+        start_from_ref=args.start_from_ref,
+        infer_frames=args.infer_frames,
+        extra_args=args.extra_arg or [],
     )
 
 
@@ -645,6 +727,59 @@ def studio(_: argparse.Namespace) -> int:
     return 0
 
 
+def runtime_config() -> dict[str, Any]:
+    return {
+        "paths": {
+            "WAN_NATIVE_REPO": DEFAULT_NATIVE_REPO,
+            "WAN_MODEL_DIR": DEFAULT_MODEL_DIR,
+            "WAN_OUTPUT_DIR": DEFAULT_OUTPUT_DIR,
+            "WAN_STATE_DIR": DEFAULT_STATE_DIR,
+        },
+        "defaults": {
+            "task": "t2v-A14B",
+            "size": "1280x720",
+            "gpus": 1,
+            "frame_num": "native default unless set",
+            "sample_steps": "native default unless set",
+            "sample_shift": "native default unless set",
+            "sample_guide_scale": "native default unless set",
+            "offload_model": True,
+            "convert_model_dtype": True,
+            "t5_cpu": False,
+            "prompt_extend": False,
+        },
+        "precision": {
+            "text_encoder": "bf16 checkpoint: models_t5_umt5-xxl-enc-bf16.pth",
+            "model_param_dtype": "bf16 from native Wan2.2 config",
+            "convert_model_dtype": "enabled by default; pass --no-convert-dtype to disable",
+            "offload_model": "enabled by default; pass --no-offload to disable",
+        },
+        "env_file": "/etc/wan.env",
+    }
+
+
+def config_cmd(args: argparse.Namespace) -> int:
+    cfg = runtime_config()
+    if args.json:
+        print(json.dumps(cfg, indent=2, sort_keys=True))
+        return 0
+    header("config", "WAN runtime defaults and tunables")
+    for key, value in cfg["paths"].items():
+        kv(key, value)
+    print()
+    suite("defaults", TEAL, [(key, str(value)) for key, value in cfg["defaults"].items()])
+    print()
+    suite("precision", GOLD, [(key, str(value)) for key, value in cfg["precision"].items()])
+    print()
+    suite("configure", INDIGO, [
+        ("render flags", "--size --gpus --model-dir --native-repo --output-dir --state-dir --no-offload --no-convert-dtype --t5-cpu"),
+        ("custom dimensions", "--frame-num --sample-steps --sample-shift --sample-guide-scale --sample-solver --extra-arg"),
+        ("service env", "edit /etc/wan.env, then sudo systemctl restart wan-worker"),
+        ("worker user", "wan-worker.service runs as ubuntu so CLI queue writes remain valid"),
+    ])
+    return 0
+
+
 def gpu(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {}
     try:
@@ -840,30 +975,127 @@ def worker(args: argparse.Namespace) -> int:
             return 0
 
 
+def parse_ts(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def duration_label(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds < 60:
+        return f"{int(round(seconds))}s"
+    if seconds < 3600:
+        return f"{int(round(seconds / 60))}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def job_duration(job: dict[str, Any]) -> float | None:
+    raw = job.get("seconds")
+    if isinstance(raw, (int, float)) and raw > 0:
+        return float(raw)
+    started = parse_ts(job.get("started_at") or job.get("created_at"))
+    finished = parse_ts(job.get("finished_at"))
+    if started and finished and finished > started:
+        return finished - started
+    return None
+
+
+def output_manifest(spec: dict[str, Any]) -> dict[str, Any]:
+    job_id = safe_job_id(spec.get("job_id") or spec.get("id") or "")
+    output_dir = pathlib.Path(str(spec.get("output_dir") or DEFAULT_OUTPUT_DIR)).expanduser()
+    manifest = output_dir / job_id / "manifest.json"
+    return read_json(manifest) if manifest.is_file() else {}
+
+
+def job_record(path: pathlib.Path, state: str) -> dict[str, Any]:
+    spec = read_json(path)
+    manifest = output_manifest(spec)
+    merged = {**spec, **manifest}
+    merged["state"] = state
+    merged["state_file"] = str(path)
+    merged["job_id"] = safe_job_id(merged.get("job_id") or path.stem)
+    merged["output_path"] = str(pathlib.Path(str(merged.get("output_dir") or DEFAULT_OUTPUT_DIR)).expanduser() / merged["job_id"])
+    return merged
+
+
+def duration_estimate(records: list[dict[str, Any]], fallback: float = 900.0) -> float:
+    samples = [
+        duration for record in records
+        for duration in [job_duration(record)]
+        if duration and duration > 0 and str(record.get("state")).lower() == "done"
+    ]
+    if not samples:
+        return fallback
+    samples = sorted(samples[-12:])
+    return samples[len(samples) // 2]
+
+
+def collect_job_records(paths: dict[str, pathlib.Path], limit: int) -> dict[str, list[dict[str, Any]]]:
+    return {
+        name: [
+            job_record(path, name)
+            for path in sorted(paths[name].glob("*.json"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:limit]
+        ]
+        for name in ("queue", "running", "done", "failed")
+    }
+
+
+def print_job_record(record: dict[str, Any], estimate: float, queued_ahead: float, verbose: bool) -> float:
+    state = str(record.get("state") or "")
+    job_id = safe_job_id(record.get("job_id"))
+    prompt = str(record.get("prompt") or "").strip()
+    started = parse_ts(record.get("started_at") or record.get("created_at"))
+    elapsed = max(0.0, time.time() - started) if started and state == "running" else None
+    eta = max(0.0, estimate - (elapsed or 0.0)) if state == "running" else queued_ahead + estimate
+    duration = job_duration(record)
+    facts = [
+        str(record.get("task") or "t2v-A14B"),
+        str(record.get("size") or ""),
+        f"seed {record.get('seed')}" if record.get("seed") is not None else "",
+        f"elapsed {duration_label(elapsed)}" if elapsed is not None else "",
+        f"eta {duration_label(eta)}" if state in {"queue", "running"} else "",
+        f"duration {duration_label(duration)}" if duration is not None else "",
+    ]
+    print(f"    {paint(TEAL, job_id)} {state_text(state)} {soft(' · '.join(x for x in facts if x))}")
+    if prompt:
+        print(f"      {prompt[:140]}")
+    if record.get("output_path"):
+        print(f"      {soft(str(record['output_path']))}")
+    if verbose:
+        print(f"      {soft(str(record.get('state_file') or ''))}")
+        if record.get("error"):
+            print(f"      {paint(ROSE, str(record.get('error'))[:220])}")
+    return eta if state == "queue" else queued_ahead
+
+
 def jobs(args: argparse.Namespace) -> int:
     paths = ensure_state_dirs(args.state_dir)
+    records = collect_job_records(paths, args.limit)
+    all_records = [record for values in records.values() for record in values]
+    estimate = duration_estimate(all_records)
     if args.json:
-        payload = {
-            name: [str(path) for path in sorted(paths[name].glob("*.json"))[-args.limit:]]
-            for name in ("queue", "running", "done", "failed")
-        }
-        print(json.dumps({"state_dir": args.state_dir, "jobs": payload}, indent=2, sort_keys=True))
+        print(json.dumps({"state_dir": args.state_dir, "estimate_seconds": estimate, "jobs": records}, indent=2, sort_keys=True))
         return 0
     header("jobs", "WAN queue state")
     kv("state dir", args.state_dir)
+    kv("duration estimate", duration_label(estimate))
+    queued_ahead = 0.0
     for name in ("queue", "running", "done", "failed"):
-        files = sorted(paths[name].glob("*.json"))
-        kv(name, state_text(str(len(files))) if files else "0")
-        show_rows = args.verbose or name in {"queue", "running"}
+        rows = records[name]
+        kv(name, state_text(str(len(rows))) if rows else "0")
+        show_rows = args.verbose or name in {"queue", "running", "failed"} or (name == "done" and args.done)
         if show_rows:
-            for path in files[-args.limit:]:
-                spec = read_json(path)
-                job_id = safe_job_id(spec.get("job_id") or path.stem)
-                prompt = str(spec.get("prompt") or "").strip()
-                detail = f"{job_id}  {prompt[:96]}" if prompt else job_id
-                print(f"    {paint(TEAL, detail)}")
-                if args.verbose:
-                    print(f"      {soft(str(path))}")
+            for record in rows:
+                queued_ahead = print_job_record(record, estimate, queued_ahead, args.verbose)
     return 0
 
 
@@ -1185,6 +1417,30 @@ def add_job_args(parser: argparse.ArgumentParser, *, state: bool = False) -> Non
     parser.add_argument("--t5-cpu", action="store_true")
     parser.add_argument("--no-offload", action="store_true")
     parser.add_argument("--no-convert-dtype", action="store_true")
+    parser.add_argument("--frame-num", type=int)
+    parser.add_argument("--sample-solver", choices=["unipc", "dpm++"])
+    parser.add_argument("--sample-steps", type=int)
+    parser.add_argument("--sample-shift", type=float)
+    parser.add_argument("--sample-guide-scale")
+    parser.add_argument("--save-file")
+    parser.add_argument("--image")
+    parser.add_argument("--prompt-extend-method", choices=["dashscope", "local_qwen"])
+    parser.add_argument("--prompt-extend-model")
+    parser.add_argument("--prompt-extend-target-lang", choices=["zh", "en"])
+    parser.add_argument("--src-root-path")
+    parser.add_argument("--refert-num", type=int)
+    parser.add_argument("--replace-flag", action="store_true")
+    parser.add_argument("--use-relighting-lora", action="store_true")
+    parser.add_argument("--num-clip", type=int)
+    parser.add_argument("--audio")
+    parser.add_argument("--enable-tts", action="store_true")
+    parser.add_argument("--tts-prompt-audio")
+    parser.add_argument("--tts-prompt-text")
+    parser.add_argument("--tts-text")
+    parser.add_argument("--pose-video")
+    parser.add_argument("--start-from-ref", action="store_true")
+    parser.add_argument("--infer-frames", type=int)
+    parser.add_argument("--extra-arg", action="append", default=[], help="append a raw native Wan2.2 argument; repeat for each token")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1202,6 +1458,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_colors = sub.add_parser("colors", aliases=["theme"])
     p_colors.set_defaults(func=palette)
+
+    p_config = sub.add_parser("config", aliases=["defaults", "vars"])
+    p_config.add_argument("--json", action="store_true")
+    p_config.set_defaults(func=config_cmd)
 
     p_gpu = sub.add_parser("gpu", aliases=["gpus", "nvidia"])
     p_gpu.add_argument("--json", action="store_true")
@@ -1258,11 +1518,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--stop-on-failure", action="store_true")
     p_worker.set_defaults(func=worker)
 
-    p_jobs = sub.add_parser("jobs", aliases=["queue"])
+    p_jobs = sub.add_parser("jobs", aliases=["queue", "pipeline"])
     p_jobs.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     p_jobs.add_argument("--verbose", "-v", action="store_true")
     p_jobs.add_argument("--limit", type=int, default=20)
     p_jobs.add_argument("--json", action="store_true")
+    p_jobs.add_argument("--done", action="store_true", help="include completed rows in the detailed listing")
     p_jobs.set_defaults(func=jobs)
 
     p_nexus = sub.add_parser("nexus")

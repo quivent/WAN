@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/WAN
+EnvironmentFile=-/etc/wan.env
 Environment=WAN_HOME=/opt/WAN
 Environment=WAN_NATIVE_REPO=/opt/Wan2.2
 Environment=WAN_MODEL_DIR=/models/Wan2.2-T2V-A14B
