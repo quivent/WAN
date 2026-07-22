@@ -19,8 +19,6 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-DEFAULT_NATIVE_REPO = os.environ.get("WAN_NATIVE_REPO", "/opt/Wan2.2")
-DEFAULT_MODEL_DIR = os.environ.get("WAN_MODEL_DIR", "/models/Wan2.2-T2V-A14B")
 DEFAULT_OUTPUT_DIR = os.environ.get("WAN_OUTPUT_DIR", "/runs/wan/outputs" if pathlib.Path("/runs/wan").exists() else "outputs")
 DEFAULT_STATE_DIR = os.environ.get("WAN_STATE_DIR", "/runs/wan/.wand" if pathlib.Path("/runs/wan").exists() else ".wand")
 DEFAULT_COUNCIL_ROOT = os.environ.get("COUNCIL_ROOT", str(pathlib.Path.home() / "Council-of-Gemmas"))
@@ -34,6 +32,57 @@ MODEL_PRESETS = {
     "I2V": ("Wan-AI/Wan2.2-I2V-A14B", "/models/Wan2.2-I2V-A14B"),
     "TI2V": ("Wan-AI/Wan2.2-TI2V-5B", "/models/Wan2.2-TI2V-5B"),
 }
+
+
+def valid_native_repo(path: str) -> bool:
+    root = pathlib.Path(path).expanduser()
+    return (root / "generate.py").is_file()
+
+
+def resolve_native_repo() -> str:
+    candidates = [
+        os.environ.get("WAN_NATIVE_REPO", ""),
+        "/opt/Wan2.2",
+        str(pathlib.Path.home() / "Wan2.2"),
+        str(pathlib.Path.home() / "Council-of-Gemmas" / "cli" / "cmd" / "embedded" / "wan-pipeline"),
+    ]
+    for candidate in candidates:
+        if candidate and valid_native_repo(candidate):
+            return candidate
+    return os.environ.get("WAN_NATIVE_REPO", "/opt/Wan2.2")
+
+
+def valid_wan_model_dir(path: str) -> bool:
+    root = pathlib.Path(path).expanduser()
+    if not root.is_dir():
+        return False
+    markers = [
+        root / "Wan2.2_VAE.pth",
+        root / "models_t5_umt5-xxl-enc-bf16.pth",
+        root / "low_noise_model",
+        root / "high_noise_model",
+    ]
+    return any(marker.exists() for marker in markers) and any(root.rglob("*.safetensors"))
+
+
+def resolve_wan_model_dir(target: str = "T2V") -> str:
+    preset_dir = MODEL_PRESETS.get(str(target or "T2V").upper(), MODEL_PRESETS["T2V"])[1]
+    candidates = [
+        os.environ.get("WAN_MODEL_DIR", ""),
+        preset_dir,
+        "/models/Wan2.2-T2V-A14B",
+        "/models/Wan2.2-I2V-A14B",
+        "/models/Wan2.2-TI2V-5B",
+        str(pathlib.Path.home() / "models" / pathlib.Path(preset_dir).name),
+    ]
+    for candidate in candidates:
+        if candidate and valid_wan_model_dir(candidate):
+            return candidate
+    return os.environ.get("WAN_MODEL_DIR", preset_dir)
+
+
+DEFAULT_NATIVE_REPO = resolve_native_repo()
+DEFAULT_MODEL_DIR = resolve_wan_model_dir()
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -596,6 +645,51 @@ def studio(_: argparse.Namespace) -> int:
     return 0
 
 
+def gpu(args: argparse.Namespace) -> int:
+    payload: dict[str, Any] = {}
+    try:
+        import torch
+
+        payload["torch"] = torch.__version__
+        payload["cuda_available"] = bool(torch.cuda.is_available())
+        payload["cuda_device_count"] = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        payload["cuda_devices"] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+    except Exception as exc:
+        payload["torch_error"] = f"{type(exc).__name__}: {exc}"
+    if shutil.which("nvidia-smi"):
+        query = [
+            "nvidia-smi",
+            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ]
+        result = subprocess.run(query, capture_output=True, text=True, check=False)
+        payload["nvidia_smi"] = [line for line in result.stdout.splitlines() if line.strip()]
+        pmon = subprocess.run(["nvidia-smi", "pmon", "-c", "1"], capture_output=True, text=True, check=False)
+        payload["nvidia_pmon"] = [line for line in pmon.stdout.splitlines() if line.strip()]
+    else:
+        payload["nvidia_smi"] = []
+        payload["nvidia_pmon"] = []
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0 if payload.get("cuda_available") else 1
+    header("gpu", "WAN runtime GPU view")
+    kv("python", sys.executable)
+    kv("torch", payload.get("torch", "unknown"))
+    kv("cuda", state_text("ready" if payload.get("cuda_available") else "missing"))
+    kv("device count", payload.get("cuda_device_count", 0))
+    for index, name in enumerate(payload.get("cuda_devices") or []):
+        kv(f"gpu {index}", name)
+    rows = payload.get("nvidia_smi") or []
+    if rows:
+        print()
+        suite("nvidia-smi", TEAL, [(str(row)[:30].strip(), str(row)[30:].strip()) for row in rows])
+    processes = payload.get("nvidia_pmon") or []
+    if processes:
+        print()
+        suite("processes", GOLD, [(str(row)[:30].strip(), str(row)[30:].strip()) for row in processes])
+    return 0 if payload.get("cuda_available") else 1
+
+
 def plan(args: argparse.Namespace) -> int:
     spec = spec_from_args(args)
     command = native_command(spec)
@@ -760,9 +854,16 @@ def jobs(args: argparse.Namespace) -> int:
     for name in ("queue", "running", "done", "failed"):
         files = sorted(paths[name].glob("*.json"))
         kv(name, state_text(str(len(files))) if files else "0")
-        if args.verbose:
+        show_rows = args.verbose or name in {"queue", "running"}
+        if show_rows:
             for path in files[-args.limit:]:
-                print(f"    {paint(TEAL, str(path))}")
+                spec = read_json(path)
+                job_id = safe_job_id(spec.get("job_id") or path.stem)
+                prompt = str(spec.get("prompt") or "").strip()
+                detail = f"{job_id}  {prompt[:96]}" if prompt else job_id
+                print(f"    {paint(TEAL, detail)}")
+                if args.verbose:
+                    print(f"      {soft(str(path))}")
     return 0
 
 
@@ -1102,6 +1203,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_colors = sub.add_parser("colors", aliases=["theme"])
     p_colors.set_defaults(func=palette)
 
+    p_gpu = sub.add_parser("gpu", aliases=["gpus", "nvidia"])
+    p_gpu.add_argument("--json", action="store_true")
+    p_gpu.set_defaults(func=gpu)
+
     p_gallery = sub.add_parser("gallery", aliases=["view"])
     p_gallery.add_argument("--addr", default="127.0.0.1:7862")
     p_gallery.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
@@ -1192,6 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
             ("studio", "show paths, model state, Nexus, and Piper"),
             ("architecture", "show CLI, queue, worker, and daemon flow"),
             ("colors", "show the WAN terminal palette"),
+            ("gpu", "show H200/Torch GPU state"),
             ("gallery --open", "start the live output wall"),
             ("download T2V", "download text-to-video weights"),
         ])
@@ -1204,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
         ])
         suite("runtime", INDIGO, [
             ("jobs --verbose", "inspect WAN queue state"),
+            ("gpu", "show GPU memory, utilization, and processes"),
             ("gallery --addr 0.0.0.0:7862", "serve queue and media stream"),
             ("worker", "run continuous H200 queue loop"),
             ("run-next", "claim one queued job"),
