@@ -18,6 +18,12 @@ DEFAULT_MODEL_DIR = os.environ.get("WAN_MODEL_DIR", "/models/Wan2.2-T2V-A14B")
 DEFAULT_OUTPUT_DIR = os.environ.get("WAN_OUTPUT_DIR", "outputs")
 DEFAULT_STATE_DIR = os.environ.get("WAN_STATE_DIR", ".wand")
 
+MODEL_PRESETS = {
+    "T2V": ("Wan-AI/Wan2.2-T2V-A14B", "/models/Wan2.2-T2V-A14B"),
+    "I2V": ("Wan-AI/Wan2.2-I2V-A14B", "/models/Wan2.2-I2V-A14B"),
+    "TI2V": ("Wan-AI/Wan2.2-TI2V-5B", "/models/Wan2.2-TI2V-5B"),
+}
+
 
 @dataclass
 class JobSpec:
@@ -318,16 +324,33 @@ def jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_model_target(target: str, model: str, local_dir: str) -> tuple[str, str]:
+    key = str(target or "T2V").upper()
+    preset = MODEL_PRESETS.get(key)
+    if preset is not None:
+        default_model, default_dir = preset
+    elif "/" in str(target):
+        default_model = str(target)
+        name = default_model.rstrip("/").split("/")[-1]
+        default_dir = f"/models/{name}"
+    elif target:
+        raise ValueError(f"unknown download target {target!r}; use T2V, I2V, TI2V, or a Hugging Face repo id")
+    else:
+        default_model, default_dir = MODEL_PRESETS["T2V"]
+    return model or default_model, local_dir or default_dir
+
+
 def download(args: argparse.Namespace) -> int:
+    model, local_dir = resolve_model_target(args.target, args.model, args.local_dir)
     bin_dir = pathlib.Path(sys.executable).parent
     hf = bin_dir / "hf"
     huggingface_cli = bin_dir / "huggingface-cli"
     if hf.exists():
-        cmd = [str(hf), "download", args.model, "--local-dir", args.local_dir]
+        cmd = [str(hf), "download", model, "--local-dir", local_dir]
     elif huggingface_cli.exists():
-        cmd = [str(huggingface_cli), "download", args.model, "--local-dir", args.local_dir]
+        cmd = [str(huggingface_cli), "download", model, "--local-dir", local_dir]
     else:
-        cmd = [shutil.which("hf") or shutil.which("huggingface-cli") or "huggingface-cli", "download", args.model, "--local-dir", args.local_dir]
+        cmd = [shutil.which("hf") or shutil.which("huggingface-cli") or "huggingface-cli", "download", model, "--local-dir", local_dir]
     print(command_string(cmd))
     if args.run:
         return subprocess.call(cmd)
@@ -342,8 +365,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.set_defaults(func=doctor)
 
     p_download = sub.add_parser("download")
-    p_download.add_argument("--model", default="Wan-AI/Wan2.2-T2V-A14B")
-    p_download.add_argument("--local-dir", default=DEFAULT_MODEL_DIR)
+    p_download.add_argument("target", nargs="?", default="T2V", help="model preset: T2V, I2V, TI2V, or a Hugging Face repo id")
+    p_download.add_argument("--model", default="", help="override Hugging Face repo id")
+    p_download.add_argument("--local-dir", default="", help="override download directory")
     p_download.add_argument("--run", action="store_true")
     p_download.set_defaults(func=download)
 
