@@ -21,7 +21,7 @@ help:
 	@echo "  make check    Compile Python modules"
 
 setup:
-	$(UV) venv $(VENV) --python $(PYTHON)
+	test -d $(VENV) || $(UV) venv $(VENV) --python $(PYTHON)
 	$(UV) pip install --python $(VENV_PY) -r requirements.txt
 	$(VENV_PY) -m pip install -e .
 
