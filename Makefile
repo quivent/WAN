@@ -23,7 +23,7 @@ help:
 setup:
 	test -d $(VENV) || $(UV) venv $(VENV) --python $(PYTHON)
 	$(UV) pip install --python $(VENV_PY) -r requirements.txt
-	$(VENV_PY) -m pip install -e .
+	$(UV) pip install --python $(VENV_PY) -e .
 
 doctor:
 	$(VENV_PY) -m wanctl.cli doctor
