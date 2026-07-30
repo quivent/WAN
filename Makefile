@@ -1,5 +1,3 @@
-SHELL := /bin/zsh
-
 PYTHON ?= python3
 UV ?= uv
 VENV ?= .venv
