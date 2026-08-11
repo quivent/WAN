@@ -25,22 +25,41 @@
 </pre>
 
 
-WAN is a private operations repo for running Wan video models on enterprise GPU
-hosts. It is an analog to the FLUX repo in ownership pattern: one focused repo
-for model setup, job manifests, repeatable commands, runtime checks, and remote
-execution hygiene.
+```text
+__        __    _    _   _ 
+\ \      / /   / \  | \ | |
+ \ \ /\ / /   / _ \ |  \| |
+  \ V  V /   / ___ \| |\  |
+   \_/\_/   /_/   \_\_| \_|
+```
 
-It is not a port of FLUX.
+**WAN Enterprise GPU Video Runner**
+*Private operations repo for running Wan video models on enterprise GPU hosts*
 
-## Scope
+[![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](#)
 
+</div>
+
+---
+
+## ⚡ Overview
+
+WAN is a private operations repo for running Wan video models on enterprise GPU hosts. It is an analog to the FLUX repo in ownership pattern: one focused repo for model setup, job manifests, repeatable commands, runtime checks, and remote execution hygiene.
+
+> [!NOTE]
+> It is not a port of FLUX.
+
+### Scope
 - Native Wan2.2 command planning for enterprise GPUs.
 - Diffusers-compatible layout hooks for later service integration.
 - Reproducible job manifests under `jobs/`.
 - GPU profiles for single-node and multi-GPU execution.
 - Docker and Slurm templates for cluster execution.
 
-## Quick Start
+---
+
+## 📦 Quick Start
 
 ```bash
 cd /Users/joshkornreich/WAN
@@ -49,7 +68,9 @@ make doctor
 make plan PROMPT="a slow cinematic push through a rainy neon market"
 ```
 
-## H200 Continuous Worker
+---
+
+## 🚀 H200 Continuous Worker
 
 On a fresh H200 host, clone this repo to `/opt/WAN`, then run:
 
@@ -64,7 +85,7 @@ download T2V
 wan doctor
 ```
 
-Queue jobs:
+### Queue jobs:
 
 ```bash
 wan render "a slow cinematic push through a rainy neon market" \
@@ -77,26 +98,26 @@ wan render "a quiet spacecraft crossing a red storm" --wait
 wan jobs --verbose
 ```
 
-Run continuously:
+### Run continuously:
 
 ```bash
 wan worker --state-dir "$WAN_STATE_DIR" --poll 10
 ```
 
-For systemd, copy `systemd/wan-worker.service` to
-`/etc/systemd/system/wan-worker.service`, adjust paths if needed, then enable
-it:
+<details>
+<summary><b>Systemd and Slurm Deployment</b></summary>
 
+For systemd, copy `systemd/wan-worker.service` to `/etc/systemd/system/wan-worker.service`, adjust paths if needed, then enable it:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now wan-worker
 ```
 
 For Slurm:
-
 ```bash
 sbatch slurm/wan-worker-h200.sbatch
 ```
+</details>
 
 The first concrete target is native Wan2.2 T2V on CUDA:
 
@@ -108,10 +129,11 @@ wan plan "a slow cinematic push through a rainy neon market" \
   --model-dir /models/Wan2.2-T2V-A14B
 ```
 
-## Runtime Model
+---
 
-The native lane wraps the official Wan repository rather than importing it into
-this repo. Set:
+## 🏗️ Runtime Model
+
+The native lane wraps the official Wan repository rather than importing it into this repo. Set:
 
 ```bash
 export WAN_NATIVE_REPO=/opt/Wan2.2
@@ -122,7 +144,9 @@ export WAN_OUTPUT_DIR=/runs/wan/outputs
 For an 8 GPU host, the planned command uses `torchrun` with FSDP and Ulysses.
 For a 1 GPU 80 GB host, it uses direct `python generate.py` with offload flags.
 
-## Job Artifact Contract
+---
+
+## 📄 Job Artifact Contract
 
 Each executed job should produce:
 
@@ -136,10 +160,11 @@ outputs/{job_id}/
   metrics.json
 ```
 
-The manifest is the source of truth: prompt, task, size, seed, model path,
-native repo path, GPU count, command, git SHA, and created timestamp.
+The manifest is the source of truth: prompt, task, size, seed, model path, native repo path, GPU count, command, git SHA, and created timestamp.
 
-## Commands
+---
+
+## 💻 Commands
 
 ```bash
 wan doctor
