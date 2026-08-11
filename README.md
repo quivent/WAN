@@ -1,4 +1,29 @@
-# WAN Enterprise GPU Video Runner
+# WAN
+
+<pre style="background: #082F49; color: #38BDF8; border: 1px solid #0284C7; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 13px; line-height: 1.25; overflow-x: auto;">
+<span style="color: #38BDF8; font-weight: bold;"> ╔═════════════════════════════════════════════════════════════════════════════════════════╗</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║                                                                                         ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   ██╗    ██╗ █████╗ ███╗   ██╗    ██████╗  ██╗    ██╗    ██████╗ ███████╗               ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   ██║    ██║██╔══██╗████╗  ██║    ╚════██╗███║    ██║    ██╔══██╗██╔════╝               ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   ██║ █╗ ██║███████║██╔██╗ ██║     █████╔╝╚██║    ██║    ██║  ██║█████╗                 ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   ██║███╗██║██╔══██║██║╚██╗██║    ██╔═══╝  ██║    ██║    ██║  ██║██╔══╝                 ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   ╚███╔███╔╝██║  ██║██║ ╚████║    ███████╗ ██║    ██║    ██████╔╝██║                    ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║    ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═══╝    ╚══════╝ ╚═╝    ╚═╝    ╚═════╝ ╚═╝                    ║</span>
+<span style="color: #38BDF8;"> ║                                                                                         ║</span>
+<span style="color: #FBBF24; font-weight: bold;"> ║        ───  V I D E O  D I F F U S I O N  &  M O T I O N  S Y N T H E S I S  ───        ║</span>
+<span style="color: #38BDF8;"> ║                                                                                         ║</span>
+<span style="color: #38BDF8; font-weight: bold;"> ╠═════════════════════════════════════════════════════════════════════════════════════════╣</span>
+<span style="color: #38BDF8;"> ║                                                                                         ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   [PIPELINE SPEC]          </span><span style="color: #E2E8F0;">WAN 2.1 Video Generation & Temporal Frame Interpolation        </span><span style="color: #38BDF8;">║</span>
+<span style="color: #38BDF8;"> ║                                                                                         ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   [FRAME SYNTHESIS]        </span><span style="color: #E2E8F0;">Keyframe Prompt t_0 ──► Latent Motion Trajectory (30 FPS)    </span><span style="color: #38BDF8;">║</span>
+<span style="color: #E2E8F0;"> ║                                               ──► Synthesized High-Res MP4 Video       </span><span style="color: #38BDF8;">║</span>
+<span style="color: #38BDF8;"> ║                                                                                         ║</span>
+<span style="color: #60A5FA; font-weight: bold;"> ║   [ACCELERATION]           </span><span style="color: #FBBF24; font-weight: bold;">NVIDIA GH200 Grace Hopper (PyTorch 2.5 + FlashAttention-3)    </span><span style="color: #38BDF8;">║</span>
+<span style="color: #38BDF8;"> ║                                                                                         ║</span>
+<span style="color: #38BDF8; font-weight: bold;"> ╚═════════════════════════════════════════════════════════════════════════════════════════╝</span>
+</pre>
+
 
 WAN is a private operations repo for running Wan video models on enterprise GPU
 hosts. It is an analog to the FLUX repo in ownership pattern: one focused repo
